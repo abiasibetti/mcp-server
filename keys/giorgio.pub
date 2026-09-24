@@ -1,0 +1,2 @@
+ssh-keygen -t ed25519 -C "giorgio@mcp" -f ~/.ssh/mcp_giorgio
+cat ~/.ssh/mcp_giorgio.pub
