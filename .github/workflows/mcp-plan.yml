@@ -4,7 +4,7 @@ name: MCP · validazione e piano
 
 on:
   pull_request:
-    branches: [main]
+    branches: [proxmox-giorgio]
     paths: ["config/**", "keys/**", "scripts/**", ".github/workflows/mcp-*.yml"]
   schedule:
     - cron: "30 5 * * *"
