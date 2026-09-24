@@ -1,0 +1,7 @@
+# Ogni modifica a configurazione, chiavi, script e workflow richiede
+# l'approvazione del team di sicurezza (sostituisci con il tuo team o utenti).
+/config/     @TUA-ORG/sicurezza
+/keys/       @TUA-ORG/sicurezza
+/scripts/    @TUA-ORG/sicurezza
+/server/     @TUA-ORG/sicurezza
+/.github/    @TUA-ORG/sicurezza

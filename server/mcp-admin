@@ -1,0 +1,465 @@
+#!/usr/bin/env bash
+# =============================================================================
+# mcp-admin — gestione di server MCP multipli e di utenti con accesso SSH limitato
+#
+# Convenzioni (per un server MCP chiamato NOME):
+#   utente di servizio   mcp-NOME             possiede credenziali e processo
+#   cartella             /opt/mcp-NOME        750, leggibile solo dal servizio
+#   script di avvio      /opt/mcp-NOME/run.sh
+#   gruppo autorizzati   mcp-NOME-users       chi può usare quel server MCP
+#   regola sudo          /etc/sudoers.d/mcp-NOME
+#
+# Utenti (persone):
+#   gruppo               mcp-users            sshd impone ForceCommand
+#   chiave autorizzata   /etc/ssh/mcp_keys/UTENTE (di root, non modificabile)
+#   nessuna shell, nessun forwarding: possono solo avviare i server MCP
+#   a cui appartengono, tramite /usr/local/bin/mcp-gateway
+#
+# Uso: sudo mcp-admin help
+# =============================================================================
+set -euo pipefail
+
+readonly MCP_BASE="/opt"
+readonly USERS_GROUP="mcp-users"
+readonly KEYS_DIR="/etc/ssh/mcp_keys"
+readonly GATEWAY="/usr/local/bin/mcp-gateway"
+readonly SSHD_DROPIN="/etc/ssh/sshd_config.d/10-mcp-users.conf"
+readonly SUDOERS_DIR="/etc/sudoers.d"
+SERVER_HOST="${MCP_SERVER_HOST:-$(hostname -f 2>/dev/null || hostname)}"
+
+TMPDIR_KEY=""
+cleanup() {
+  if [[ -n "${TMPDIR_KEY}" && -d "${TMPDIR_KEY}" ]]; then
+    find "${TMPDIR_KEY}" -type f -exec shred -u {} + 2>/dev/null || true
+    rm -rf "${TMPDIR_KEY}"
+  fi
+}
+trap cleanup EXIT
+
+# ----------------------------------------------------------------------------- utilità
+die()  { echo "ERRORE: $*" >&2; exit 1; }
+info() { echo "==> $*"; }
+warn() { echo "ATTENZIONE: $*" >&2; }
+
+need_root() { [[ ${EUID} -eq 0 ]] || die "esegui come root (sudo mcp-admin ...)"; }
+need_setup() { [[ -x "${GATEWAY}" ]] || die "esegui prima: sudo mcp-admin setup"; }
+
+valid_server_name() {
+  [[ "$1" =~ ^[a-z][a-z0-9-]{0,19}$ ]] \
+    || die "nome server non valido '$1' (minuscole, cifre e '-', max 20 caratteri, inizia con una lettera)"
+}
+
+valid_user_name() {
+  [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "nome utente non valido '$1'"
+  [[ "$1" != mcp-* ]] || die "i nomi 'mcp-*' sono riservati agli utenti di servizio"
+}
+
+server_exists() { id "mcp-$1" &>/dev/null && [[ -d "${MCP_BASE}/mcp-$1" ]]; }
+
+in_group() { id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -qx "$2"; }
+
+require_mcp_user() {
+  id "$1" &>/dev/null || die "l'utente '$1' non esiste"
+  in_group "$1" "${USERS_GROUP}" || die "'$1' non è un utente MCP (non appartiene a ${USERS_GROUP})"
+}
+
+relabel() { command -v restorecon >/dev/null 2>&1 && restorecon -R "$@" 2>/dev/null || true; }
+
+kill_sessions() {
+  if pkill -u "$1" 2>/dev/null; then info "sessioni attive di '$1' terminate"; fi
+}
+
+split_servers() { tr ',' ' ' <<<"$1"; }
+
+# ----------------------------------------------------------------------------- setup
+install_gateway() {
+  local tmp; tmp="$(mktemp)"
+  cat >"${tmp}" <<'GATEWAY_EOF'
+#!/usr/bin/env bash
+# mcp-gateway — eseguito da sshd (ForceCommand) per i membri del gruppo mcp-users.
+# Accetta solo il nome di un server MCP a cui l'utente è autorizzato e lo avvia
+# come utente di servizio tramite sudo. Tutto viene registrato nel journal.
+set -euo pipefail
+req="${SSH_ORIGINAL_COMMAND:-}"
+me="$(id -un)"
+from="${SSH_CLIENT:-sconosciuto}"; from="${from%% *}"
+log() { logger -t mcp-gateway -- "$*"; }
+
+if [[ -z "${req}" ]]; then
+  log "DENY user=${me} from=${from} reason=interactive"
+  echo "Accesso interattivo non consentito. Uso: ssh ${me}@<server> <nome-mcp>" >&2
+  exit 1
+fi
+if [[ ! "${req}" =~ ^[a-z][a-z0-9-]{0,19}$ ]]; then
+  log "DENY user=${me} from=${from} reason=invalid-request"
+  echo "Nome del server MCP non valido." >&2
+  exit 1
+fi
+if ! id -nG "${me}" | tr ' ' '\n' | grep -qx "mcp-${req}-users"; then
+  log "DENY user=${me} from=${from} server=${req} reason=not-authorized"
+  echo "Non sei autorizzato al server MCP '${req}'." >&2
+  exit 1
+fi
+log "ALLOW user=${me} from=${from} server=${req}"
+exec /usr/bin/sudo -n -u "mcp-${req}" "/opt/mcp-${req}/run.sh"
+GATEWAY_EOF
+  install -m 755 -o root -g root "${tmp}" "${GATEWAY}"
+  rm -f "${tmp}"
+  info "gateway installato: ${GATEWAY}"
+}
+
+install_sshd_dropin() {
+  local backup=""
+  [[ -f "${SSHD_DROPIN}" ]] && { backup="$(mktemp)"; cp -p "${SSHD_DROPIN}" "${backup}"; }
+  install -d -m 755 "$(dirname "${SSHD_DROPIN}")"
+  cat >"${SSHD_DROPIN}" <<EOF
+# Gestito da mcp-admin — utenti MCP: solo chiave, nessuna shell, nessun forwarding
+Match Group ${USERS_GROUP}
+    AuthorizedKeysFile ${KEYS_DIR}/%u
+    AuthenticationMethods publickey
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    ForceCommand ${GATEWAY}
+    PermitTTY no
+    DisableForwarding yes
+    PermitUserRC no
+    ClientAliveInterval 60
+    ClientAliveCountMax 3
+# Chiude il blocco Match: le righe successive tornano globali
+Match all
+EOF
+  chmod 644 "${SSHD_DROPIN}"
+  if ! sshd -t; then
+    if [[ -n "${backup}" ]]; then mv -f "${backup}" "${SSHD_DROPIN}"; else rm -f "${SSHD_DROPIN}"; fi
+    die "configurazione sshd non valida: modifica annullata"
+  fi
+  [[ -n "${backup}" ]] && rm -f "${backup}"
+  if grep -Eqs '^\s*Include\s+/etc/ssh/sshd_config\.d/' /etc/ssh/sshd_config; then :; else
+    warn "/etc/ssh/sshd_config non include sshd_config.d/*.conf: aggiungi 'Include /etc/ssh/sshd_config.d/*.conf'"
+  fi
+  systemctl reload sshd 2>/dev/null || systemctl reload ssh
+  info "configurazione sshd applicata: ${SSHD_DROPIN}"
+}
+
+cmd_setup() {
+  need_root
+  command -v sshd >/dev/null 2>&1 || die "sshd non trovato: installa openssh-server"
+  command -v sudo >/dev/null 2>&1 || die "sudo non trovato: installalo prima di continuare"
+  [[ -d "${SUDOERS_DIR}" ]] || die "${SUDOERS_DIR} non esiste"
+  grep -Eqs '^[#@]includedir[[:space:]]+/etc/sudoers\.d' /etc/sudoers \
+    || warn "/etc/sudoers non include /etc/sudoers.d: aggiungi '@includedir /etc/sudoers.d' con visudo"
+  getent group "${USERS_GROUP}" >/dev/null || { groupadd "${USERS_GROUP}"; info "creato gruppo ${USERS_GROUP}"; }
+  install -d -m 755 -o root -g root "${KEYS_DIR}"
+  install_gateway
+  install_sshd_dropin
+  relabel "${KEYS_DIR}" "${GATEWAY}" "${SSHD_DROPIN}"
+  info "setup completato"
+}
+
+# ----------------------------------------------------------------------------- server MCP
+cmd_server_add() {
+  need_root; need_setup
+  local name="${1:-}"; [[ -n "${name}" ]] || die "uso: mcp-admin server-add NOME"
+  valid_server_name "${name}"
+  local svc="mcp-${name}" grp="mcp-${name}-users" dir="${MCP_BASE}/mcp-${name}"
+
+  getent group "${grp}" >/dev/null || groupadd "${grp}"
+  if ! id "${svc}" &>/dev/null; then
+    useradd --system --no-create-home --home-dir "${dir}" \
+            --shell /usr/sbin/nologin --comment "Servizio MCP ${name}" "${svc}"
+  fi
+  install -d -m 750 -o "${svc}" -g "${svc}" "${dir}"
+  local managed=0
+  [[ -f "${dir}/.mcp-managed.json" ]] && managed=1
+  # i server gestiti da mcp-reconcile hanno codice e run.sh di root: non vanno toccati
+  [[ ${managed} -eq 1 ]] || chown -R "${svc}:${svc}" "${dir}"
+
+  if [[ ${managed} -eq 0 && ! -e "${dir}/run.sh" ]]; then
+    cat >"${dir}/run.sh" <<EOF
+#!/bin/bash
+# Script di avvio del server MCP '${name}': sostituisci le ultime due righe
+# con il comando reale (vedi la guida). Le variabili di ${name}.env vengono esportate.
+set -a
+[ -f ${dir}/${name}.env ] && source ${dir}/${name}.env
+set +a
+echo "Server MCP '${name}' non ancora configurato: modifica ${dir}/run.sh" >&2
+exit 1
+EOF
+    chown "${svc}:${svc}" "${dir}/run.sh"
+    info "creato modello ${dir}/run.sh (da completare)"
+  fi
+  [[ ${managed} -eq 1 ]] || chmod 700 "${dir}/run.sh"
+
+  local tmp; tmp="$(mktemp)"
+  cat >"${tmp}" <<EOF
+# Gestito da mcp-admin: i membri di ${grp} possono avviare solo il server MCP '${name}'
+Defaults:%${grp} !requiretty, !use_pty
+%${grp} ALL=(${svc}) NOPASSWD: ${dir}/run.sh
+EOF
+  if ! visudo -cf "${tmp}" >/dev/null; then rm -f "${tmp}"; die "regola sudoers non valida"; fi
+  install -m 440 -o root -g root "${tmp}" "${SUDOERS_DIR}/${svc}"
+  rm -f "${tmp}"
+  relabel "${dir}"
+  info "server MCP '${name}' pronto (utente ${svc}, gruppo ${grp})"
+  info "prova: sudo -u ${svc} ${dir}/run.sh"
+}
+
+cmd_server_del() {
+  need_root
+  local name="${1:-}"; [[ -n "${name}" ]] || die "uso: mcp-admin server-del NOME"
+  valid_server_name "${name}"
+  server_exists "${name}" || die "server MCP '${name}' inesistente"
+  local svc="mcp-${name}" grp="mcp-${name}-users"
+  rm -f "${SUDOERS_DIR}/${svc}"
+  pkill -u "${svc}" 2>/dev/null || true
+  groupdel "${grp}" 2>/dev/null || true
+  userdel "${svc}"
+  info "server MCP '${name}' disabilitato: regola sudo, gruppo e utente di servizio rimossi"
+  warn "la cartella ${MCP_BASE}/mcp-${name} (con le credenziali) NON è stata cancellata"
+}
+
+# ----------------------------------------------------------------------------- chiavi
+# write_key UTENTE FILE_CHIAVE_PUBBLICA|"" SCADENZA|""
+write_key() {
+  local user="$1" pubkey="$2" expire="$3" keyline opts="restrict"
+  [[ -n "${expire}" ]] && opts+=",expiry-time=\"${expire}\""
+
+  if [[ -n "${pubkey}" ]]; then
+    [[ -r "${pubkey}" ]] || die "file non leggibile: ${pubkey}"
+    keyline="$(grep -Em1 '^(ssh-|ecdsa-|sk-)' "${pubkey}" || true)"
+    [[ -n "${keyline}" ]] || die "nessuna chiave pubblica valida in ${pubkey}"
+    ssh-keygen -lf /dev/stdin <<<"${keyline}" >/dev/null 2>&1 || die "chiave pubblica non valida"
+  else
+    TMPDIR_KEY="$(mktemp -d -p /dev/shm 2>/dev/null || mktemp -d)"
+    ssh-keygen -q -t ed25519 -N "" -C "${user}@mcp-$(hostname -s)" -f "${TMPDIR_KEY}/key"
+    keyline="$(cat "${TMPDIR_KEY}/key.pub")"
+  fi
+
+  printf '%s %s\n' "${opts}" "${keyline}" >"${KEYS_DIR}/${user}.new"
+  chown root:root "${KEYS_DIR}/${user}.new"
+  chmod 644 "${KEYS_DIR}/${user}.new"
+  mv -f "${KEYS_DIR}/${user}.new" "${KEYS_DIR}/${user}"
+  rm -f "${KEYS_DIR}/${user}.disabled"
+  relabel "${KEYS_DIR}/${user}"
+  info "chiave autorizzata: $(ssh-keygen -lf /dev/stdin <<<"${keyline}" | awk '{print $2}')"
+}
+
+print_client_instructions() {
+  local user="$1" servers="$2" keypath="~/.ssh/mcp_${user}"
+  echo
+  if [[ -n "${TMPDIR_KEY}" ]]; then
+    echo "=================== CHIAVE PRIVATA DI ${user} (mostrata UNA SOLA VOLTA) ==================="
+    cat "${TMPDIR_KEY}/key"
+    echo "=========================================================================================="
+    echo
+    echo "La chiave privata NON resta sul server. Trasmettila all'utente su un canale sicuro."
+    echo
+    echo "Sul client di ${user}:"
+    echo "  1. Salva il blocco sopra (incluse le righe BEGIN/END) in ${keypath}"
+    echo "  2. chmod 600 ${keypath}"
+    echo "  3. Registra i server MCP in Claude Code:"
+  else
+    keypath="<percorso-chiave-privata>"
+    echo "Sul client di ${user} registra i server MCP in Claude Code:"
+  fi
+  local s
+  for s in $(split_servers "${servers}"); do
+    echo "     claude mcp add --scope user ${s} -- ssh -i ${keypath} -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 -T ${user}@${SERVER_HOST} ${s}"
+  done
+  echo
+  echo "Primo collegamento (accetta la fingerprint del server): ssh -i ${keypath} -T ${user}@${SERVER_HOST} ${s:-NOME}"
+  echo "La risposta 'Server MCP non ancora configurato' o l'attesa silenziosa indicano che l'accesso funziona."
+}
+
+parse_key_opts() {
+  # imposta OPT_PUBKEY, OPT_EXPIRE, OPT_SERVERS da "$@"
+  OPT_PUBKEY=""; OPT_EXPIRE=""; OPT_SERVERS=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --servers) [[ $# -ge 2 ]] || die "--servers richiede un valore"; OPT_SERVERS="$2"; shift 2 ;;
+      --pubkey)  [[ $# -ge 2 ]] || die "--pubkey richiede un file";   OPT_PUBKEY="$2";  shift 2 ;;
+      --expire)  [[ $# -ge 2 ]] || die "--expire richiede AAAAMMGG";  OPT_EXPIRE="$2";  shift 2 ;;
+      *) die "opzione sconosciuta: $1" ;;
+    esac
+  done
+  if [[ -n "${OPT_EXPIRE}" ]]; then
+    [[ "${OPT_EXPIRE}" =~ ^[0-9]{8}$ ]] || die "--expire deve essere nel formato AAAAMMGG"
+    date -d "${OPT_EXPIRE}" >/dev/null 2>&1 || die "data di scadenza non valida: ${OPT_EXPIRE}"
+  fi
+}
+
+# ----------------------------------------------------------------------------- utenti
+cmd_user_add() {
+  need_root; need_setup
+  local user="${1:-}"; [[ -n "${user}" ]] || die "uso: mcp-admin user-add UTENTE --servers a,b [--pubkey FILE] [--expire AAAAMMGG]"
+  shift
+  valid_user_name "${user}"
+  parse_key_opts "$@"
+  [[ -n "${OPT_SERVERS}" ]] || die "indica almeno un server con --servers (es. --servers wazuh,unifi)"
+  id "${user}" &>/dev/null && die "l'utente '${user}' esiste già"
+  local s
+  for s in $(split_servers "${OPT_SERVERS}"); do
+    valid_server_name "${s}"; server_exists "${s}" || die "server MCP '${s}' inesistente (crealo con server-add)"
+  done
+
+  useradd --create-home --shell /bin/bash --comment "Utente MCP" --groups "${USERS_GROUP}" "${user}"
+  usermod -p '*' "${user}"          # nessuna password, ma account non bloccato per le chiavi
+  chmod 700 "$(getent passwd "${user}" | cut -d: -f6)"
+  for s in $(split_servers "${OPT_SERVERS}"); do gpasswd -a "${user}" "mcp-${s}-users" >/dev/null; done
+
+  write_key "${user}" "${OPT_PUBKEY}" "${OPT_EXPIRE}"
+  info "utente '${user}' creato con accesso a: ${OPT_SERVERS}"
+  print_client_instructions "${user}" "${OPT_SERVERS}"
+}
+
+cmd_user_grant() {
+  need_root
+  local user="${1:-}" server="${2:-}"
+  [[ -n "${user}" && -n "${server}" ]] || die "uso: mcp-admin user-grant UTENTE SERVER"
+  require_mcp_user "${user}"; valid_server_name "${server}"
+  server_exists "${server}" || die "server MCP '${server}' inesistente"
+  gpasswd -a "${user}" "mcp-${server}-users" >/dev/null
+  info "'${user}' ora può usare '${server}' (vale dalla prossima connessione)"
+}
+
+cmd_user_revoke() {
+  need_root
+  local user="${1:-}" server="${2:-}"
+  [[ -n "${user}" && -n "${server}" ]] || die "uso: mcp-admin user-revoke UTENTE SERVER"
+  require_mcp_user "${user}"; valid_server_name "${server}"
+  gpasswd -d "${user}" "mcp-${server}-users" >/dev/null 2>&1 || warn "'${user}' non era autorizzato a '${server}'"
+  kill_sessions "${user}"
+  info "accesso di '${user}' a '${server}' revocato"
+}
+
+cmd_user_rotate_key() {
+  need_root
+  local user="${1:-}"; [[ -n "${user}" ]] || die "uso: mcp-admin user-rotate-key UTENTE [--pubkey FILE] [--expire AAAAMMGG]"
+  shift
+  require_mcp_user "${user}"
+  parse_key_opts "$@"
+  write_key "${user}" "${OPT_PUBKEY}" "${OPT_EXPIRE}"
+  kill_sessions "${user}"
+  local servers
+  servers="$(id -nG "${user}" | tr ' ' '\n' | sed -n 's/^mcp-\(.*\)-users$/\1/p' | paste -sd, -)"
+  print_client_instructions "${user}" "${servers}"
+}
+
+cmd_user_lock() {
+  need_root
+  local user="${1:-}"; [[ -n "${user}" ]] || die "uso: mcp-admin user-lock UTENTE"
+  require_mcp_user "${user}"
+  [[ -f "${KEYS_DIR}/${user}" ]] && mv -f "${KEYS_DIR}/${user}" "${KEYS_DIR}/${user}.disabled"
+  kill_sessions "${user}"
+  info "'${user}' sospeso (riattiva con: mcp-admin user-unlock ${user})"
+}
+
+cmd_user_unlock() {
+  need_root
+  local user="${1:-}"; [[ -n "${user}" ]] || die "uso: mcp-admin user-unlock UTENTE"
+  require_mcp_user "${user}"
+  [[ -f "${KEYS_DIR}/${user}.disabled" ]] || die "'${user}' non risulta sospeso"
+  mv -f "${KEYS_DIR}/${user}.disabled" "${KEYS_DIR}/${user}"
+  info "'${user}' riattivato"
+}
+
+cmd_user_del() {
+  need_root
+  local user="${1:-}"; [[ -n "${user}" ]] || die "uso: mcp-admin user-del UTENTE"
+  require_mcp_user "${user}"
+  kill_sessions "${user}"
+  sleep 1
+  userdel -r "${user}" 2>/dev/null || userdel "${user}"
+  rm -f "${KEYS_DIR}/${user}" "${KEYS_DIR}/${user}.disabled"
+  info "utente '${user}' eliminato"
+}
+
+# ----------------------------------------------------------------------------- elenco
+cmd_list() {
+  echo "SERVER MCP"
+  printf '  %-20s %-9s %s\n' "NOME" "RUN.SH" "UTENTI AUTORIZZATI"
+  local d name state members found=0
+  for d in "${MCP_BASE}"/mcp-*/; do
+    [[ -d "${d}" ]] || continue
+    name="$(basename "${d}")"; name="${name#mcp-}"
+    id "mcp-${name}" &>/dev/null || continue
+    found=1
+    if [[ -e "${d}run.sh" ]]; then
+      if grep -qs 'non ancora configurato' "${d}run.sh"; then state="modello"; else state="ok"; fi
+    else
+      state="assente"
+    fi
+    members="$(getent group "mcp-${name}-users" | cut -d: -f4)"
+    printf '  %-20s %-9s %s\n' "${name}" "${state}" "${members:--}"
+  done
+  [[ ${found} -eq 1 ]] || echo "  (nessuno)"
+
+  echo
+  echo "UTENTI MCP"
+  printf '  %-20s %-11s %-10s %s\n' "UTENTE" "CHIAVE" "SCADENZA" "SERVER"
+  local u key expire servers
+  local users; users="$(getent group "${USERS_GROUP}" | cut -d: -f4 | tr ',' ' ')"
+  [[ -n "${users// /}" ]] || { echo "  (nessuno)"; return 0; }
+  for u in ${users}; do
+    if   [[ -f "${KEYS_DIR}/${u}" ]];          then key="attiva"
+    elif [[ -f "${KEYS_DIR}/${u}.disabled" ]]; then key="sospesa"
+    else                                            key="mancante"; fi
+    expire="$(grep -hos 'expiry-time="[0-9]*"' "${KEYS_DIR}/${u}" "${KEYS_DIR}/${u}.disabled" 2>/dev/null \
+              | head -n1 | tr -dc '0-9' || true)"
+    servers="$(id -nG "${u}" | tr ' ' '\n' | sed -n 's/^mcp-\(.*\)-users$/\1/p' | paste -sd, -)"
+    if [[ -n "${expire}" && "${key}" == "attiva" && "${expire}" -lt "$(date +%Y%m%d)" ]]; then key="scaduta"; fi
+    printf '  %-20s %-11s %-10s %s\n' "${u}" "${key}" "${expire:--}" "${servers:--}"
+  done
+}
+
+# ----------------------------------------------------------------------------- aiuto
+usage() {
+  cat <<EOF
+mcp-admin — gestione di server MCP e utenti con accesso SSH limitato
+
+Configurazione iniziale (una volta):
+  setup                                   gruppo mcp-users, gateway, regole sshd
+
+Server MCP:
+  server-add NOME                         crea utente di servizio, cartella, gruppo e regola sudo
+  server-del NOME                         rimuove regola sudo, gruppo e utente (non la cartella)
+
+Utenti:
+  user-add UTENTE --servers a,b [--pubkey FILE] [--expire AAAAMMGG]
+                                          crea l'utente; senza --pubkey genera una chiave
+                                          ed25519 e la mostra una sola volta
+  user-grant UTENTE SERVER                autorizza un server MCP
+  user-revoke UTENTE SERVER               revoca un server MCP (chiude le sessioni)
+  user-rotate-key UTENTE [--pubkey FILE] [--expire AAAAMMGG]
+                                          sostituisce la chiave
+  user-lock UTENTE / user-unlock UTENTE   sospende / riattiva l'accesso
+  user-del UTENTE                         elimina l'utente
+
+  list                                    mostra server, utenti, permessi e scadenze
+
+Variabili:
+  MCP_SERVER_HOST   nome o IP del server da mostrare nelle istruzioni (predefinito: hostname -f)
+EOF
+}
+
+# ----------------------------------------------------------------------------- main
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "${cmd}" in
+    setup)            cmd_setup "$@" ;;
+    server-add)       cmd_server_add "$@" ;;
+    server-del)       cmd_server_del "$@" ;;
+    user-add)         cmd_user_add "$@" ;;
+    user-grant)       cmd_user_grant "$@" ;;
+    user-revoke)      cmd_user_revoke "$@" ;;
+    user-rotate-key)  cmd_user_rotate_key "$@" ;;
+    user-lock)        cmd_user_lock "$@" ;;
+    user-unlock)      cmd_user_unlock "$@" ;;
+    user-del)         cmd_user_del "$@" ;;
+    list)             cmd_list ;;
+    help|-h|--help)   usage ;;
+    *)                usage; exit 1 ;;
+  esac
+}
+
+main "$@"

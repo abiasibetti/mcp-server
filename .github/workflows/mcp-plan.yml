@@ -1,0 +1,45 @@
+# Validazione e piano (sola lettura) su ogni pull request, ogni notte e a richiesta.
+# Il piano notturno segnala eventuali modifiche fatte a mano sul server (drift).
+name: MCP · validazione e piano
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ["config/**", "keys/**", "scripts/**", ".github/workflows/mcp-*.yml"]
+  schedule:
+    - cron: "30 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mcp-plan-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    # niente esecuzioni per PR provenienti da fork
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, mcp-plan]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Dipendenze Python
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet pyyaml==6.0.2
+          echo "PYTHON=$RUNNER_TEMP/venv/bin/python" >> "$GITHUB_ENV"
+
+      - name: Validazione dei file YAML e delle chiavi
+        run: $PYTHON scripts/build_state.py validate
+
+      - name: Piano sul server MCP (sola lettura)
+        env:
+          MCP_SSH_KEY: ${{ secrets.MCP_PLAN_SSH_KEY }}
+          MCP_SSH_KNOWN_HOSTS: ${{ vars.MCP_SSH_KNOWN_HOSTS }}
+          MCP_SERVER_HOST: ${{ vars.MCP_SERVER_HOST }}
+        run: bash scripts/ssh_run.sh plan

@@ -1,0 +1,71 @@
+# Deploy dopo il merge su main: piano -> approvazione -> applicazione.
+# Il job "apply" usa l'environment protetto "mcp-production": si ferma finché un
+# revisore autorizzato non approva, e solo dopo riceve i secret (chiave apply e credenziali).
+name: MCP · deploy
+
+on:
+  push:
+    branches: [main]
+    paths: ["config/**", "keys/**", "scripts/**", ".github/workflows/mcp-*.yml"]
+  # da usare anche dopo aver ruotato un secret su GitHub
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mcp-deploy
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: [self-hosted, linux, mcp-plan]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Dipendenze Python
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet pyyaml==6.0.2
+          echo "PYTHON=$RUNNER_TEMP/venv/bin/python" >> "$GITHUB_ENV"
+
+      - name: Validazione
+        run: $PYTHON scripts/build_state.py validate
+
+      - name: Piano (da controllare prima di approvare)
+        env:
+          MCP_SSH_KEY: ${{ secrets.MCP_PLAN_SSH_KEY }}
+          MCP_SSH_KNOWN_HOSTS: ${{ vars.MCP_SSH_KNOWN_HOSTS }}
+          MCP_SERVER_HOST: ${{ vars.MCP_SERVER_HOST }}
+        run: bash scripts/ssh_run.sh plan
+
+  apply:
+    needs: plan
+    runs-on: [self-hosted, linux, mcp-apply]
+    environment:
+      name: mcp-production
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Dipendenze Python
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet pyyaml==6.0.2
+          echo "PYTHON=$RUNNER_TEMP/venv/bin/python" >> "$GITHUB_ENV"
+
+      - name: Validazione
+        run: $PYTHON scripts/build_state.py validate
+
+      - name: Applicazione sul server MCP
+        env:
+          MCP_SSH_KEY: ${{ secrets.MCP_APPLY_SSH_KEY }}
+          MCP_SSH_KNOWN_HOSTS: ${{ vars.MCP_SSH_KNOWN_HOSTS }}
+          MCP_SERVER_HOST: ${{ vars.MCP_SERVER_HOST }}
+          SECRETS_JSON: ${{ toJSON(secrets) }}
+        run: bash scripts/ssh_run.sh apply

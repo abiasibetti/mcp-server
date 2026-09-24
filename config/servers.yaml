@@ -1,0 +1,55 @@
+# =============================================================================
+# Server MCP gestiti dalla pipeline
+#
+# - I valori { secret: NOME } vengono letti dai secret dell'environment GitHub
+#   "mcp-production" e non compaiono mai nel repository né nei log.
+# - {dir} viene sostituito con la cartella del server (/opt/mcp-NOME).
+# - Per dismettere un server non cancellarlo: imposta  state: absent
+# =============================================================================
+
+policy:
+  # blocca l'apply se in un colpo solo verrebbero eliminati più utenti di così
+  max_user_deletions: 3
+
+servers:
+
+  wazuh:
+    install:
+      method: binary
+      # scegli la release da https://github.com/gbrigandi/mcp-server-wazuh/releases
+      url: https://github.com/gbrigandi/mcp-server-wazuh/releases/download/<VERSIONE>/mcp-server-wazuh-linux-amd64
+      # calcolalo con:  curl -sL <url> | sha256sum
+      sha256: "<SHA256>"
+      name: mcp-server-wazuh
+    command: ["{dir}/bin/mcp-server-wazuh", "--transport", "stdio"]
+    env:
+      WAZUH_API_HOST: 192.168.10.50
+      WAZUH_API_PORT: 55000
+      WAZUH_API_USERNAME: { secret: WAZUH_API_USERNAME }
+      WAZUH_API_PASSWORD: { secret: WAZUH_API_PASSWORD }
+      WAZUH_INDEXER_HOST: 192.168.10.50
+      WAZUH_INDEXER_PORT: 9200
+      WAZUH_INDEXER_USERNAME: { secret: WAZUH_INDEXER_USERNAME }
+      WAZUH_INDEXER_PASSWORD: { secret: WAZUH_INDEXER_PASSWORD }
+      WAZUH_VERIFY_SSL: false
+      RUST_LOG: warn
+
+  unifi:
+    install:
+      method: pip
+      # versione fissa: controlla l'ultima su https://pypi.org/project/unifi-network-mcp/
+      package: unifi-network-mcp==<VERSIONE>
+      python: "3.13"
+    command: ["{dir}/venv/bin/unifi-network-mcp"]
+    env:
+      UNIFI_HOST: 192.168.10.1
+      UNIFI_USERNAME: { secret: UNIFI_USERNAME }
+      UNIFI_PASSWORD_FILE: "{dir}/password"
+      UNIFI_VERIFY_SSL: false
+    files:
+      # file 640 root:mcp-unifi con il contenuto del secret
+      password: { secret: UNIFI_PASSWORD }
+
+  # Esempio di server dismesso:
+  # vecchio-server:
+  #   state: absent

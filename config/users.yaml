@@ -1,0 +1,24 @@
+# =============================================================================
+# Utenti MCP gestiti dalla pipeline
+#
+# - Aggiungere un utente:  metti la sua chiave pubblica in keys/NOME.pub
+#                          e aggiungi una voce qui sotto.
+# - Togliere un server:    rimuovilo dalla lista "servers".
+# - Sospendere:            enabled: false   (la chiave resta, l'accesso no)
+# - Deprovisioning:        cancella la voce (e il file .pub): l'utente viene eliminato.
+# - La chiave privata resta sempre sul PC dell'utente: qui solo chiavi pubbliche.
+# =============================================================================
+
+users:
+
+  alice:
+    servers: [wazuh, unifi]
+    expire: 2027-12-31          # facoltativo: dopo questa data la chiave non vale più
+
+  bob:
+    servers: [wazuh]
+
+  # carla:
+  #   servers: [unifi]
+  #   enabled: false
+  #   key_file: keys/carla-laptop.pub   # facoltativo, predefinito keys/NOME.pub

@@ -1,0 +1,577 @@
+#!/usr/bin/env python3
+"""
+mcp-reconcile — allinea server MCP e utenti allo stato desiderato ricevuto su stdin (JSON).
+
+    mcp-reconcile plan  < stato.json    mostra le modifiche, non modifica nulla
+    mcp-reconcile apply < stato.json    applica le modifiche (lo stato deve contenere i segreti)
+
+Viene eseguito come root, di norma tramite la chiave SSH della pipeline (utente mcp-deploy),
+e usa mcp-admin per tutte le operazioni su utenti, gruppi, chiavi e regole sudo.
+Solo libreria standard di Python 3.8+.
+"""
+import fcntl
+import grp
+import hashlib
+import json
+import os
+import pwd
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.request
+
+MCP_ADMIN = "/usr/local/sbin/mcp-admin"
+GATEWAY = "/usr/local/bin/mcp-gateway"
+BASE = "/opt"
+KEYS_DIR = "/etc/ssh/mcp_keys"
+USERS_GROUP = "mcp-users"
+UV = "/usr/local/bin/uv"
+LOCK_FILE = "/run/mcp-reconcile.lock"
+STATE_FILE = ".mcp-managed.json"
+MAX_INPUT = 1_000_000
+MAX_DOWNLOAD = 300 * 1024 * 1024
+
+RE_SERVER = re.compile(r"[a-z][a-z0-9-]{0,19}")
+RE_USER = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
+RE_ENV = re.compile(r"[A-Z_][A-Z0-9_]{0,63}")
+RE_FILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+RE_SHA256 = re.compile(r"[0-9a-f]{64}")
+RE_EXPIRE = re.compile(r"[0-9]{8}")
+RE_PKG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._\-\[\],<>=!~ ]{0,120}")
+RE_PY = re.compile(r"3\.[0-9]{1,2}")
+RE_KEY = re.compile(
+    r"(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521)|"
+    r"sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) "
+    r"([A-Za-z0-9+/]{16,}={0,3})(?: [\x21-\x7e ]{0,100})?"
+)
+RESERVED_FILES = {"run.sh", STATE_FILE, "bin", "venv", "python"}
+
+
+class Fail(Exception):
+    pass
+
+
+# ----------------------------------------------------------------------------- validazione
+def _need(cond, msg):
+    if not cond:
+        raise Fail(msg)
+
+
+def validate(state, mode):
+    _need(isinstance(state, dict), "lo stato deve essere un oggetto JSON")
+    _need(state.get("version") == 1, "versione dello stato non supportata")
+    policy = state.get("policy") or {}
+    maxdel = policy.get("max_user_deletions", 3)
+    _need(isinstance(maxdel, int) and maxdel >= 0, "policy.max_user_deletions non valido")
+
+    servers = state.get("servers") or {}
+    users = state.get("users") or {}
+    _need(isinstance(servers, dict) and isinstance(users, dict), "servers e users devono essere oggetti")
+
+    for name, s in servers.items():
+        _need(RE_SERVER.fullmatch(name), f"nome server non valido: {name!r}")
+        _need(s.get("state", "present") in ("present", "absent"), f"{name}: state non valido")
+        if s.get("state") == "absent":
+            continue
+        inst = s.get("install") or {"method": "none"}
+        method = inst.get("method")
+        if method == "binary":
+            _need(str(inst.get("url", "")).startswith("https://"), f"{name}: install.url deve essere https")
+            _need(RE_SHA256.fullmatch(str(inst.get("sha256", ""))), f"{name}: install.sha256 mancante o non valido")
+            _need(RE_FILE.fullmatch(str(inst.get("name", ""))), f"{name}: install.name non valido")
+        elif method == "pip":
+            _need(RE_PKG.fullmatch(str(inst.get("package", ""))), f"{name}: install.package non valido")
+            _need(RE_PY.fullmatch(str(inst.get("python", "3.13"))), f"{name}: install.python non valido")
+        else:
+            _need(method == "none", f"{name}: install.method deve essere binary, pip o none")
+        cmd = s.get("command")
+        _need(isinstance(cmd, list) and cmd and all(isinstance(c, str) and "\n" not in c for c in cmd),
+              f"{name}: command deve essere una lista di stringhe")
+        _need(cmd[0].replace("{dir}", sdir(name)).startswith("/"), f"{name}: command[0] deve essere un percorso assoluto")
+        for key, val in (s.get("env") or {}).items():
+            _need(RE_ENV.fullmatch(key), f"{name}: variabile non valida {key!r}")
+            _check_value(name, key, val, mode)
+        for fname, val in (s.get("files") or {}).items():
+            _need(RE_FILE.fullmatch(fname) and fname not in RESERVED_FILES and not fname.endswith(".env"),
+                  f"{name}: nome file non valido {fname!r}")
+            _check_value(name, fname, val, mode)
+
+    present = {n for n, s in servers.items() if s.get("state", "present") == "present"}
+    for u, spec in users.items():
+        _need(RE_USER.fullmatch(u) and not u.startswith("mcp-"), f"nome utente non valido: {u!r}")
+        _need(isinstance(spec.get("enabled", True), bool), f"{u}: enabled deve essere true/false")
+        srv = spec.get("servers")
+        _need(isinstance(srv, list) and srv, f"{u}: servers deve contenere almeno un server")
+        for x in srv:
+            _need(x in present, f"{u}: server {x!r} non dichiarato o dismesso")
+        key = spec.get("key", "")
+        _need(isinstance(key, str) and "\n" not in key and RE_KEY.fullmatch(key), f"{u}: chiave pubblica non valida")
+        exp = spec.get("expire")
+        _need(exp is None or (isinstance(exp, str) and RE_EXPIRE.fullmatch(exp)), f"{u}: expire deve essere AAAAMMGG")
+    return maxdel
+
+
+def _check_value(server, key, val, mode):
+    if isinstance(val, str):
+        return
+    _need(isinstance(val, dict) and isinstance(val.get("secret"), str), f"{server}: valore non valido per {key}")
+    if mode == "apply":
+        _need(isinstance(val.get("value"), str) and val["value"] != "",
+              f"{server}: manca il valore del segreto {val['secret']} (lo stato va generato in modalità apply)")
+
+
+# ----------------------------------------------------------------------------- stato attuale
+def sdir(name):
+    return os.path.join(BASE, f"mcp-{name}")
+
+
+def user_exists(u):
+    try:
+        pwd.getpwnam(u)
+        return True
+    except KeyError:
+        return False
+
+
+def server_exists(name):
+    return user_exists(f"mcp-{name}") and os.path.isdir(sdir(name))
+
+
+def mcp_users():
+    try:
+        return set(grp.getgrnam(USERS_GROUP).gr_mem)
+    except KeyError:
+        return set()
+
+
+def user_servers(u):
+    out = set()
+    for g in grp.getgrall():
+        m = re.fullmatch(r"mcp-(.+)-users", g.gr_name)
+        if m and u in g.gr_mem:
+            out.add(m.group(1))
+    return out
+
+
+def current_key(u):
+    """(attiva, tipo+chiave, scadenza) oppure (None, None, None) se non c'è chiave."""
+    for path, active in ((os.path.join(KEYS_DIR, u), True), (os.path.join(KEYS_DIR, f"{u}.disabled"), False)):
+        if os.path.isfile(path):
+            with open(path) as f:
+                line = f.readline().strip()
+            opts, _, rest = line.partition(" ")
+            parts = rest.split()
+            material = " ".join(parts[:2]) if len(parts) >= 2 else ""
+            m = re.search(r'expiry-time="([0-9]{8})"', opts)
+            return active, material, (m.group(1) if m else None)
+    return None, None, None
+
+
+def managed_state(name):
+    try:
+        with open(os.path.join(sdir(name), STATE_FILE)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def parse_env_file(path):
+    vals = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                m = re.match(r"\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)=(.*)$", line.rstrip("\n"))
+                if m:
+                    try:
+                        vals[m.group(1)] = " ".join(shlex.split(m.group(2)))
+                    except ValueError:
+                        vals[m.group(1)] = m.group(2)
+    except OSError:
+        pass
+    return vals
+
+
+def read_file(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+# ----------------------------------------------------------------------------- rendering
+def subst(name, text):
+    return text.replace("{dir}", sdir(name))
+
+
+def value_of(name, val):
+    return subst(name, val) if isinstance(val, str) else val.get("value")
+
+
+def render_env(name, env):
+    lines = [f"# Generato da mcp-reconcile per il server MCP '{name}': non modificare a mano"]
+    for k in sorted(env):
+        lines.append(f"export {k}={shlex.quote(value_of(name, env[k]))}")
+    return "\n".join(lines) + "\n"
+
+
+def render_run(name, cmd):
+    d = sdir(name)
+    argv = " ".join(shlex.quote(subst(name, c)) for c in cmd)
+    return (
+        "#!/bin/bash\n"
+        f"# Generato da mcp-reconcile per il server MCP '{name}': non modificare a mano\n"
+        "set -euo pipefail\n"
+        "set -a\n"
+        f"source {shlex.quote(os.path.join(d, name + '.env'))}\n"
+        "set +a\n"
+        f"cd {shlex.quote(d)}\n"
+        f"exec {argv}\n"
+    )
+
+
+def install_hash(inst):
+    return hashlib.sha256(json.dumps(inst, sort_keys=True).encode()).hexdigest()
+
+
+def describe_install(inst):
+    m = inst.get("method", "none")
+    if m == "binary":
+        return f"binario {inst['name']} (sha256 {inst['sha256'][:12]}…)"
+    if m == "pip":
+        return f"pacchetto {inst['package']} (Python {inst.get('python', '3.13')})"
+    return "nessuna"
+
+
+# ----------------------------------------------------------------------------- operazioni
+def run(cmd, env=None):
+    p = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, env=env)
+    if p.returncode != 0:
+        msg = (p.stderr or p.stdout).strip().splitlines()
+        raise Fail(f"{os.path.basename(cmd[0])} {cmd[1] if len(cmd) > 1 else ''}: {msg[-1] if msg else 'errore'}")
+    return p.stdout
+
+
+def admin(*args):
+    return run([MCP_ADMIN, *args])
+
+
+def svc_ids(name):
+    return pwd.getpwnam(f"mcp-{name}").pw_uid, grp.getgrnam(f"mcp-{name}").gr_gid
+
+
+def write_atomic(path, content, uid, gid, mode):
+    d = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.chown(tmp, uid, gid)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def fix_code_perms(name, path):
+    _, gid = svc_ids(name)
+    run(["chown", "-R", f"root:{gid}", path])
+    run(["chmod", "-R", "u+rwX,g+rX,g-w,o-rwx", path])
+
+
+def install_binary(name, inst):
+    d = sdir(name)
+    bindir = os.path.join(d, "bin")
+    _, gid = svc_ids(name)
+    os.makedirs(bindir, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir="/var/tmp", prefix="mcp-dl-")
+    try:
+        h = hashlib.sha256()
+        size = 0
+        req = urllib.request.Request(inst["url"], headers={"User-Agent": "mcp-reconcile"})
+        with urllib.request.urlopen(req, timeout=120) as r, os.fdopen(fd, "wb") as f:
+            while True:
+                chunk = r.read(1 << 16)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_DOWNLOAD:
+                    raise Fail("download troppo grande")
+                h.update(chunk)
+                f.write(chunk)
+        if h.hexdigest() != inst["sha256"]:
+            raise Fail(f"sha256 non corrispondente per {inst['url']}: scaricato {h.hexdigest()}")
+        dest = os.path.join(bindir, inst["name"])
+        os.chown(tmp, 0, gid)
+        os.chmod(tmp, 0o750)
+        shutil.move(tmp, dest)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    fix_code_perms(name, bindir)
+
+
+def install_pip(name, inst):
+    if not os.access(UV, os.X_OK):
+        raise Fail(f"{UV} non trovato: installa uv sul server (vedi guida)")
+    d = sdir(name)
+    venv, pydir = os.path.join(d, "venv"), os.path.join(d, "python")
+    shutil.rmtree(venv, ignore_errors=True)
+    shutil.rmtree(pydir, ignore_errors=True)
+    cache = tempfile.mkdtemp(prefix="mcp-uv-", dir="/var/tmp")
+    env = dict(os.environ, UV_PYTHON_INSTALL_DIR=pydir, UV_CACHE_DIR=cache, HOME="/root")
+    try:
+        run([UV, "venv", "--quiet", "--python", inst.get("python", "3.13"), venv], env=env)
+        run([UV, "pip", "install", "--quiet", "--python", os.path.join(venv, "bin", "python"), inst["package"]], env=env)
+    finally:
+        shutil.rmtree(cache, ignore_errors=True)
+    fix_code_perms(name, venv)
+    if os.path.isdir(pydir):
+        fix_code_perms(name, pydir)
+
+
+def do_install(name, inst):
+    if inst["method"] == "binary":
+        install_binary(name, inst)
+    elif inst["method"] == "pip":
+        install_pip(name, inst)
+
+
+def save_state(name, inst):
+    path = os.path.join(sdir(name), STATE_FILE)
+    write_atomic(path, json.dumps({"install_hash": install_hash(inst)}) + "\n", 0, 0, 0o600)
+
+
+def write_config(name, spec):
+    uid, gid = svc_ids(name)
+    d = sdir(name)
+    write_atomic(os.path.join(d, f"{name}.env"), render_env(name, spec.get("env") or {}), 0, gid, 0o640)
+    for fname, val in (spec.get("files") or {}).items():
+        write_atomic(os.path.join(d, fname), value_of(name, val), 0, gid, 0o640)
+    write_atomic(os.path.join(d, "run.sh"), render_run(name, spec["command"]), 0, gid, 0o750)
+
+
+def with_keyfile(user, key, fn):
+    fd, path = tempfile.mkstemp(prefix="mcp-key-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(key + "\n")
+        return fn(path)
+    finally:
+        os.unlink(path)
+
+
+# ----------------------------------------------------------------------------- piano
+class Plan:
+    ICON = {"+": "🟢", "~": "🟡", "-": "🔴", "!": "⚠️"}
+
+    def __init__(self):
+        self.actions = []
+        self.notes = []
+
+    def add(self, sym, text, fn=None):
+        self.actions.append((sym, text, fn))
+
+    def note(self, text):
+        self.notes.append(text)
+
+
+def plan_servers(plan, servers, mode):
+    for name in sorted(servers):
+        spec = servers[name]
+        exists = server_exists(name)
+        if spec.get("state") == "absent":
+            if exists:
+                plan.add("-", f"server `{name}`: dismesso (utente di servizio e regola sudo rimossi, cartella conservata)",
+                         lambda n=name: admin("server-del", n))
+            continue
+
+        inst = spec.get("install") or {"method": "none"}
+        st = managed_state(name) if exists else None
+        if not exists:
+            plan.add("+", f"server `{name}`: creazione", lambda n=name: admin("server-add", n))
+        elif st is None:
+            plan.add("~", f"server `{name}`: presa in gestione (run.sh e {name}.env verranno riscritti)")
+
+        if inst["method"] != "none" and (st is None or st.get("install_hash") != install_hash(inst)):
+            plan.add("+" if not exists else "~", f"server `{name}`: installazione {describe_install(inst)}",
+                     lambda n=name, i=inst: do_install(n, i))
+
+        d = sdir(name)
+        env = spec.get("env") or {}
+        files = spec.get("files") or {}
+        changes = []
+        if not exists:
+            changes.append(f"{len(env)} variabili, {len(files)} file")
+        else:
+            cur = parse_env_file(os.path.join(d, f"{name}.env"))
+            added = sorted(set(env) - set(cur))
+            removed = sorted(set(cur) - set(env))
+            modified = []
+            for k in sorted(set(env) & set(cur)):
+                v = env[k]
+                if isinstance(v, str) or mode == "apply":
+                    if value_of(name, v) != cur[k]:
+                        modified.append(k + (" (segreto)" if not isinstance(v, str) else ""))
+            for label, items in (("aggiunte", added), ("rimosse", removed), ("modificate", modified)):
+                if items:
+                    changes.append(f"variabili {label}: {', '.join(items)}")
+            for fname, v in sorted(files.items()):
+                cur_f = read_file(os.path.join(d, fname))
+                if cur_f is None:
+                    changes.append(f"nuovo file {fname}")
+                elif (isinstance(v, str) or mode == "apply") and cur_f != value_of(name, v):
+                    changes.append(f"file {fname} aggiornato")
+            if read_file(os.path.join(d, "run.sh")) != render_run(name, spec["command"]):
+                changes.append("run.sh aggiornato")
+        if changes:
+            plan.add("+" if not exists else "~", f"server `{name}`: configurazione ({'; '.join(changes)})",
+                     lambda n=name, s=spec: write_config(n, s))
+        elif st is None and exists:
+            plan.add("~", f"server `{name}`: configurazione riscritta", lambda n=name, s=spec: write_config(n, s))
+        # lo stato di gestione viene salvato sempre dopo le operazioni sul server
+        plan.actions.append((None, None, lambda n=name, i=inst: save_state(n, i)))
+
+
+def plan_users(plan, users, servers, maxdel):
+    existing = mcp_users()
+    revokes, deletes = [], []
+    for u in sorted(users):
+        spec = users[u]
+        want_srv = set(spec["servers"])
+        key, expire, enabled = spec["key"], spec.get("expire"), spec.get("enabled", True)
+        material = " ".join(key.split()[:2])
+        exp_args = ["--expire", expire] if expire else []
+
+        if user_exists(u) and u not in existing:
+            raise Fail(f"l'utente di sistema {u!r} esiste ma non è un utente MCP: scegli un altro nome")
+
+        if u not in existing:
+            srv = ",".join(sorted(want_srv))
+            plan.add("+", f"utente `{u}`: creazione con accesso a {srv}" + (f", scadenza {expire}" if expire else ""),
+                     lambda u=u, k=key, s=srv, e=exp_args:
+                     with_keyfile(u, k, lambda p: admin("user-add", u, "--servers", s, "--pubkey", p, *e)))
+            if not enabled:
+                plan.add("~", f"utente `{u}`: sospeso", lambda u=u: admin("user-lock", u))
+            continue
+
+        cur_srv = user_servers(u)
+        for s in sorted(want_srv - cur_srv):
+            plan.add("+", f"utente `{u}`: accesso a `{s}`", lambda u=u, s=s: admin("user-grant", u, s))
+        for s in sorted(cur_srv - want_srv):
+            if servers.get(s, {}).get("state") == "absent":
+                continue
+            revokes.append(("-", f"utente `{u}`: revoca accesso a `{s}`", lambda u=u, s=s: admin("user-revoke", u, s)))
+
+        active, cur_material, cur_exp = current_key(u)
+        rotated = False
+        if cur_material != material or cur_exp != expire:
+            what = "nuova chiave" if cur_material != material else f"scadenza {expire or 'rimossa'}"
+            plan.add("~", f"utente `{u}`: {what}",
+                     lambda u=u, k=key, e=exp_args:
+                     with_keyfile(u, k, lambda p: admin("user-rotate-key", u, "--pubkey", p, *e)))
+            rotated = True
+            active = True  # la rotazione riattiva la chiave
+        if enabled and active is False:
+            plan.add("~", f"utente `{u}`: riattivato", lambda u=u: admin("user-unlock", u))
+        elif not enabled and (active or rotated):
+            plan.add("~", f"utente `{u}`: sospeso", lambda u=u: admin("user-lock", u))
+
+    for u in sorted(existing - set(users)):
+        deletes.append(("-", f"utente `{u}`: eliminato", lambda u=u: admin("user-del", u)))
+    if len(deletes) > maxdel:
+        raise Fail(f"il piano elimina {len(deletes)} utenti (limite policy.max_user_deletions = {maxdel}): "
+                   "se è voluto, alza il limite nel file di configurazione")
+    for a in revokes + deletes:
+        plan.add(*a)
+
+
+def build_plan(state, mode):
+    maxdel = validate(state, mode)
+    if not os.access(GATEWAY, os.X_OK):
+        raise Fail("mcp-admin setup non eseguito sul server")
+    servers = state.get("servers") or {}
+    users = state.get("users") or {}
+    plan = Plan()
+    live = {n: s for n, s in servers.items() if s.get("state", "present") == "present"}
+    dead = {n: s for n, s in servers.items() if s.get("state") == "absent"}
+    plan_servers(plan, live, mode)
+    plan_users(plan, users, servers, maxdel)
+    plan_servers(plan, dead, mode)
+    if mode == "plan" and any((s.get("env") or s.get("files")) for s in live.values()):
+        plan.note("I valori segreti non sono disponibili in fase di piano: vengono confrontati durante l'apply.")
+    unmanaged = sorted(
+        os.path.basename(p)[4:] for p in (os.path.join(BASE, x) for x in os.listdir(BASE))
+        if os.path.basename(p).startswith("mcp-") and os.path.isdir(p)
+        and os.path.basename(p)[4:] not in servers and user_exists(os.path.basename(p))
+    )
+    for n in unmanaged:
+        plan.note(f"Il server `{n}` esiste sul server ma non è dichiarato nel file: viene ignorato.")
+    return plan
+
+
+# ----------------------------------------------------------------------------- main
+def main():
+    if len(sys.argv) != 2 or sys.argv[1] not in ("plan", "apply"):
+        print(__doc__, file=sys.stderr)
+        return 2
+    mode = sys.argv[1]
+    if os.geteuid() != 0:
+        print("mcp-reconcile deve essere eseguito come root", file=sys.stderr)
+        return 2
+
+    lock = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("❌ un'altra esecuzione di mcp-reconcile è in corso", file=sys.stderr)
+        return 1
+
+    raw = sys.stdin.read(MAX_INPUT + 1)
+    if len(raw) > MAX_INPUT:
+        print("❌ stato troppo grande", file=sys.stderr)
+        return 1
+    try:
+        state = json.loads(raw)
+        plan = build_plan(state, mode)
+    except (ValueError, Fail) as e:
+        print(f"### ❌ Stato non valido\n\n{e}")
+        return 1
+
+    visible = [a for a in plan.actions if a[0]]
+    title = "Piano" if mode == "plan" else "Applicazione"
+    print(f"### {title} MCP — {len(visible)} modifiche\n")
+    if not visible:
+        print("Nessuna modifica: il server è già allineato alla configurazione.\n")
+
+    rc = 0
+    for sym, text, fn in plan.actions:
+        if mode == "plan":
+            if sym:
+                print(f"- {Plan.ICON[sym]} {text}")
+            continue
+        try:
+            if fn:
+                fn()
+            if sym:
+                print(f"- ✅ {Plan.ICON[sym]} {text}")
+        except Exception as e:  # noqa: BLE001 — qualsiasi errore interrompe l'applicazione
+            print(f"- ❌ {Plan.ICON.get(sym, '')} {text or 'salvataggio stato'}: {e}")
+            print("\n**Applicazione interrotta**: le operazioni successive non sono state eseguite.")
+            rc = 1
+            break
+
+    for n in plan.notes:
+        print(f"\n> {n}")
+    if rc == 0 and mode == "apply":
+        subprocess.run(["logger", "-t", "mcp-reconcile", f"apply completato: {len(visible)} modifiche"], check=False)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())
