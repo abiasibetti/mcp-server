@@ -1,71 +1,749 @@
-# Server MCP interno per Wazuh e UniFi (UDM Pro) con Claude Code
+# Piattaforma MCP interna — Manuale di installazione e d'uso
 
-Guida per installare su un server interno due server MCP, uno per **Wazuh** e uno per **UniFi Network (UDM Pro)**, e usarli da un client **Fedora** tramite **Claude Code**.
+Questo manuale descrive come installare, configurare e usare una piattaforma che ospita **server MCP** (Model Context Protocol) su un server Linux interno. La piattaforma li rende disponibili a più utenti tramite **Claude Code** e li gestisce in modo dichiarativo con **GitHub Actions**.
 
 ---
 
 ## Indice
 
-1. [Architettura](#1-architettura)
-2. [Segnaposto usati nella guida](#2-segnaposto-usati-nella-guida)
-3. [Client Fedora: installare Claude Code](#3-client-fedora-installare-claude-code)
-4. [Server MCP: preparazione di base](#4-server-mcp-preparazione-di-base)
-5. [Accesso SSH senza password dal Fedora](#5-accesso-ssh-senza-password-dal-fedora)
-6. [Wazuh](#6-wazuh)
-7. [UniFi / UDM Pro](#7-unifi--udm-pro)
-8. [Registrare i server in Claude Code](#8-registrare-i-server-in-claude-code)
-9. [Risoluzione dei problemi](#9-risoluzione-dei-problemi)
-10. [Rimozione](#10-rimozione)
-11. [Sicurezza: più server MCP e più utenti](#11-sicurezza-più-server-mcp-e-più-utenti)
-12. [Automazione con GitHub Actions (GitOps)](#12-automazione-con-github-actions-gitops)
+1. [Panoramica](#1-panoramica)
+2. [Requisiti](#2-requisiti)
+3. [Installazione del server MCP](#3-installazione-del-server-mcp)
+4. [Installazione del runner GitHub Actions](#4-installazione-del-runner-github-actions)
+5. [Configurazione del repository GitHub](#5-configurazione-del-repository-github)
+6. [Riferimento della configurazione dichiarativa](#6-riferimento-della-configurazione-dichiarativa)
+7. [Operazioni di amministrazione](#7-operazioni-di-amministrazione)
+8. [Guida per l'utente finale](#8-guida-per-lutente-finale)
+9. [Gestione manuale con mcp-admin](#9-gestione-manuale-con-mcp-admin)
+10. [Monitoraggio, audit e verifiche di sicurezza](#10-monitoraggio-audit-e-verifiche-di-sicurezza)
+11. [Risoluzione dei problemi](#11-risoluzione-dei-problemi)
+12. [Configurazione dei server MCP: Wazuh, UniFi, Proxmox](#12-configurazione-dei-server-mcp-wazuh-unifi-proxmox)
+- [Appendice A — Codice sorgente](#appendice-a--codice-sorgente)
+- [Appendice B — Evoluzione: segreti in HashiCorp Vault](#appendice-b--evoluzione-segreti-in-hashicorp-vault)
+- [Riferimenti](#riferimenti)
 
 ---
 
-## 1. Architettura
+### Convenzioni
 
-```
-┌──────────────────┐   SSH (stdio MCP)   ┌──────────────────────┐   HTTPS 55000/9200   ┌──────────────┐
-│  Fedora          │ ──────────────────► │  Server MCP interno  │ ───────────────────► │  Wazuh       │
-│  Claude Code     │                     │  utente: mcp         │                      │  (manager +  │
-│                  │                     │  /opt/mcp-wazuh      │                      │   indexer)   │
-│                  │                     │  /opt/mcp-unifi      │   HTTPS 443          ├──────────────┤
-│                  │                     │                      │ ───────────────────► │  UDM Pro     │
-└──────────────────┘                     └──────────────────────┘                      └──────────────┘
-```
-
-Scelte di progetto:
-
-- **Trasporto stdio via SSH.** Claude Code lancia il server MCP sul server interno tramite SSH. Non servono porte aperte per l'MCP, l'autenticazione è quella delle chiavi SSH e le credenziali di Wazuh e UniFi restano **solo sul server**.
-- **Account in sola lettura** su Wazuh (API e Indexer) e su UniFi, così Claude non può modificare nulla, qualunque cosa gli venga chiesto.
-- **Claude Code (CLI)** sul client. Claude Desktop non ha una versione ufficiale per Linux, e i connettori di claude.ai web richiedono un server raggiungibile da Internet.
-
-Progetti utilizzati:
-
-| Componente | Progetto | Linguaggio |
-|---|---|---|
-| Wazuh | [gbrigandi/mcp-server-wazuh](https://github.com/gbrigandi/mcp-server-wazuh) | Rust (binario precompilato) |
-| UniFi | [sirkirby/unifi-mcp](https://github.com/sirkirby/unifi-mcp) (pacchetto `unifi-network-mcp`) | Python 3.13+ |
-
----
-
-## 2. Segnaposto usati nella guida
-
-Sostituiscili con i tuoi valori:
+I comandi preceduti da `sudo` vanno eseguiti sul server indicato nel paragrafo da un utente amministratore. Gli altri comandi vanno eseguiti come utente normale. I valori in maiuscolo sono **segnaposto** da sostituire:
 
 | Segnaposto | Significato |
 |---|---|
-| `IP-SERVER-MCP` | IP del server interno che ospita i server MCP |
-| `IP-WAZUH` | IP della macchina Wazuh (manager e indexer) |
-| `IP-UDM-PRO` | IP del UDM Pro |
-| `mcp_readonly` | Utente API di Wazuh in sola lettura |
-| `mcp_indexer` | Utente dell'Indexer di Wazuh in sola lettura |
-| `mcp_viewer` | Amministratore locale UniFi con ruolo *View Only* |
+| `IP-SERVER-MCP` | IP del server che ospita i server MCP |
+| `IP-RUNNER` | IP della macchina con il runner GitHub Actions |
+| `TUA-ORG/NOME-REPO` | organizzazione e nome del repository GitHub di configurazione |
+| `NOME` | nome di un server MCP (es. `proxmox`) |
+| `UTENTE` | nome di un utente della piattaforma (es. `giorgio`) |
+| `<VERSIONE>`, `<SHA256>` | versione e impronta di un pacchetto o binario |
 
 ---
 
-## 3. Client Fedora: installare Claude Code
+## 1. Panoramica
 
-Usa l'**installer nativo**: non richiede Node.js né permessi di root e si aggiorna da solo.
+### 1.1 A cosa serve
+
+Un server MCP espone a un assistente AI degli strumenti per interrogare o gestire un sistema, per esempio un SIEM, un hypervisor o una rete. Questa piattaforma consente di:
+
+- installare più server MCP su un'unica macchina interna, ciascuno isolato con il proprio utente di servizio e le proprie credenziali;
+- dare accesso a più persone, ognuna autorizzata solo ai server MCP che le servono;
+- tenere le credenziali dei sistemi (API key, token, password) **fuori** dai PC degli utenti;
+- gestire server e utenti con **file YAML versionati su GitHub**, con piano delle modifiche, revisione e approvazione prima di ogni applicazione.
+
+### 1.2 Architettura
+
+```
+  PC utente                         Server MCP interno                                   Sistemi
+┌──────────────┐  SSH (chiave)  ┌──────────────────────────────────────────────┐
+│ Claude Code  │ ─────────────► │ sshd  ── Match Group mcp-users               │
+│              │  "ssh … NOME"  │   └► mcp-gateway   (è autorizzato a NOME?)   │
+└──────────────┘                │        └► sudo -u mcp-NOME /opt/mcp-NOME/run.sh ──► API di NOME
+                                │              (legge NOME.env, avvia il server │   (Wazuh, UniFi,
+                                │               MCP su stdin/stdout)            │    Proxmox, …)
+                                └──────────────────────────────────────────────┘
+                                                     ▲
+ GitHub                        Runner interno        │ SSH (utente mcp-deploy, comando forzato)
+┌──────────────────┐  job   ┌──────────────────┐     │
+│ repo di config.  │ ─────► │ build_state.py   │ ────┘  mcp-reconcile plan | apply
+│ YAML + chiavi    │        │ ssh_run.sh       │
+│ secret, approvaz.│        └──────────────────┘
+└──────────────────┘
+```
+
+Il client non si collega mai direttamente ai sistemi. Apre una sessione SSH verso il server MCP chiedendo **solo il nome** del server MCP da usare. Il gateway verifica l'autorizzazione e avvia il server MCP con l'utente di servizio corretto. Il protocollo MCP viaggia poi nella sessione SSH.
+
+### 1.3 Componenti
+
+| Componente | Dove | Funzione |
+|---|---|---|
+| `mcp-gateway` | server MCP, `/usr/local/bin` | comando forzato per gli utenti: accetta solo il nome di un server autorizzato e lo avvia |
+| `mcp-admin` | server MCP, `/usr/local/sbin` | gestione di server MCP, utenti, chiavi e regole sudo |
+| `mcp-reconcile` | server MCP, `/usr/local/sbin` | confronta lo stato desiderato con quello reale, mostra il piano, applica le differenze |
+| `install-deploy.sh` | repository, `server/` | prepara il server MCP per la pipeline (utente `mcp-deploy`, chiavi, sudo, sshd) |
+| `build_state.py` | repository, `scripts/` | valida i YAML e produce lo stato JSON, con o senza segreti |
+| `ssh_run.sh` | repository, `scripts/` | invia lo stato al server via SSH e pubblica l'esito nel riepilogo del job |
+| `mcp-plan.yml` | repository, workflow | validazione e piano su ogni PR, ogni notte e a richiesta |
+| `mcp-deploy.yml` | repository, workflow | dopo il merge su `main`: piano → approvazione → applicazione |
+
+### 1.4 Convenzioni sul server MCP
+
+Per un server MCP chiamato `NOME`:
+
+| Elemento | Valore |
+|---|---|
+| Utente di servizio | `mcp-NOME` (senza shell, possiede solo la propria cartella) |
+| Cartella | `/opt/mcp-NOME` (permessi `750`) |
+| Codice | `/opt/mcp-NOME/bin/` o `/opt/mcp-NOME/venv/`, di proprietà di root |
+| Avvio | `/opt/mcp-NOME/run.sh` (`750 root:mcp-NOME`) |
+| Variabili e credenziali | `/opt/mcp-NOME/NOME.env` e file segreti (`640 root:mcp-NOME`) |
+| Gruppo degli utenti autorizzati | `mcp-NOME-users` |
+| Regola sudo | `/etc/sudoers.d/mcp-NOME` (consente solo `run.sh`) |
+
+Per gli utenti:
+
+| Elemento | Valore |
+|---|---|
+| Gruppo | `mcp-users` (sshd impone il gateway, niente shell né forwarding) |
+| Chiave autorizzata | `/etc/ssh/mcp_keys/UTENTE` (di root, con scadenza opzionale) |
+
+### 1.5 Modello di sicurezza
+
+| Livello | Protezione |
+|---|---|
+| Rete | SSH raggiungibile solo dalle reti autorizzate; le porte dei sistemi sono aperte solo verso il server MCP |
+| Autenticazione | solo chiavi SSH; la chiave privata resta sul PC dell'utente |
+| Utenti | nessuna shell, nessun TTY, nessun tunnel: possono solo avviare i server MCP autorizzati |
+| Isolamento tra server | ogni server MCP ha il proprio utente di servizio e non può leggere le credenziali degli altri |
+| Credenziali | leggibili solo dall'utente di servizio; nel repository compaiono solo come riferimenti |
+| Account sui sistemi | dedicati e, dove possibile, in sola lettura |
+| Pipeline | PR con revisione, piano leggibile, approvazione, chiavi di piano e di applicazione separate e vincolate dal server |
+| Tracciabilità | cronologia Git, approvazioni GitHub, log di gateway, reconcile, sudo e sshd, auditd |
+
+Tutti gli utenti dello stesso server MCP condividono l'account sul sistema di destinazione. Nei log di quel sistema compare quindi sempre lo stesso account. Per sapere *chi* ha usato il server, fai riferimento ai log del gateway (capitolo 10). Se servono permessi diversi per persona, crea due server MCP distinti, per esempio `proxmox` in sola lettura e `proxmox-admin`, ciascuno con il proprio account e il proprio gruppo.
+
+### 1.6 Ruoli
+
+| Ruolo | Attività |
+|---|---|
+| Amministratore della piattaforma | installa e mantiene server MCP e runner, gestisce le credenziali nei secret |
+| Revisore / approvatore | revisiona le PR (CODEOWNERS) e approva i deploy |
+| Utente | genera la propria chiave, configura Claude Code e usa i server MCP autorizzati |
+
+---
+
+## 2. Requisiti
+
+### 2.1 Server MCP
+
+Serve un server Linux dedicato: Fedora, RHEL e derivate, oppure Debian e Ubuntu. Deve avere:
+
+- `openssh-server`, `sudo`, `python3` (3.8 o superiore);
+- `uv` in `/usr/local/bin` per i server MCP installati da PyPI;
+- SELinux o AppArmor attivi;
+- accesso in rete verso i sistemi da interrogare;
+- accesso in uscita verso GitHub e PyPI per le installazioni automatiche.
+
+### 2.2 Runner GitHub Actions
+
+Il server MCP sta nella rete interna, quindi i runner ospitati da GitHub non lo raggiungono. Serve un **runner self-hosted**, preferibilmente su una VM dedicata. Il manuale usa Fedora come esempio (capitolo 4).
+
+In un ambiente di test il runner può stare sulla stessa macchina del server MCP. In produzione conviene separarlo: chi compromette il runner ottiene la chiave di applicazione e le credenziali in transito.
+
+### 2.3 GitHub
+
+Serve un repository **privato** per la configurazione. L'approvazione nativa dei deploy usa i *required reviewers* degli environment:
+
+- nei repository privati questa funzione richiede **GitHub Enterprise**;
+- con Free, Pro e Team è disponibile solo per i repository pubblici;
+- environment, secret di environment e restrizioni sui branch sono invece disponibili anche con Pro e Team.
+
+Su Team o Pro l'approvazione è affidata alla revisione obbligatoria delle PR da parte dei CODEOWNERS (paragrafo 5.4).
+
+### 2.4 Client degli utenti
+
+Servono Linux, macOS o Windows con OpenSSH e **Claude Code**.
+
+### 2.5 Sistemi di destinazione
+
+Per ogni sistema serve un account **dedicato** alla piattaforma, con i permessi minimi necessari (idealmente sola lettura) e raggiungibile dal server MCP. Il capitolo 12 descrive gli account per Wazuh, UniFi e Proxmox.
+
+---
+
+## 3. Installazione del server MCP
+
+L'installazione si fa una volta sola. Gli script si trovano nella cartella `server/` del repository di configurazione (capitolo 5): copiala sul server MCP prima di iniziare, per esempio in `~/mcp-setup`. Se il runner è sulla stessa macchina, **non lavorare nella cartella `_work` del runner**: copiala altrove.
+
+```bash
+sudo cp -r /opt/actions-runner/_work/NOME-REPO/NOME-REPO/server ~/mcp-setup   # solo se il repository è già lì
+sudo chown -R "$USER": ~/mcp-setup
+```
+
+### 3.1 Pacchetti di base
+
+Fedora / RHEL:
+
+```bash
+sudo dnf install -y python3 sudo openssh-server policycoreutils-python-utils audit
+sudo systemctl enable --now sshd
+```
+
+Debian / Ubuntu:
+
+```bash
+sudo apt install -y python3 sudo openssh-server auditd
+```
+
+Installa `uv` a livello di sistema (serve per i server MCP distribuiti su PyPI):
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sudo env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh
+```
+
+### 3.2 Hardening del sistema
+
+> ⚠️ Prima di modificare SSH verifica di poter accedere come amministratore **con chiave**. Tieni aperta una sessione finché non hai controllato che una nuova connessione funziona.
+
+**Aggiornamenti automatici.** Su Fedora recente usa `dnf5-plugin-automatic`, su RHEL e derivate `dnf-automatic` (con `apply_updates = yes` e `systemctl enable --now dnf-automatic.timer`), su Debian e Ubuntu `unattended-upgrades` (`sudo dpkg-reconfigure -plow unattended-upgrades`).
+
+**SSH globale.** Crea il gruppo degli amministratori e aggiungiti:
+
+```bash
+sudo groupadd ssh-admins
+sudo usermod -aG ssh-admins "$USER"
+```
+
+Crea il file `/etc/ssh/sshd_config.d/00-hardening.conf`:
+
+```
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+MaxAuthTries 3
+LoginGraceTime 30
+ClientAliveInterval 300
+ClientAliveCountMax 2
+AllowGroups ssh-admins mcp-users mcp-deploy
+```
+
+Poi verifica la configurazione e ricaricala:
+
+```bash
+sudo sshd -t && sudo systemctl reload sshd            # Debian/Ubuntu: reload ssh
+sudo sshd -T | grep -Ei 'permitrootlogin|passwordauthentication|allowgroups'
+```
+
+In sshd vale il primo valore letto: il prefisso `00-` fa prevalere queste impostazioni sugli altri file della cartella.
+
+**Firewall.** Consenti SSH solo dalle reti dei client e dall'IP del runner. Con firewalld:
+
+```bash
+sudo firewall-cmd --permanent --remove-service=ssh
+sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="RETE-CLIENT/24" service name="ssh" accept'
+sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="IP-RUNNER" service name="ssh" accept'
+sudo firewall-cmd --reload
+```
+
+Con ufw:
+
+```bash
+sudo ufw default deny incoming
+sudo ufw allow from RETE-CLIENT/24 to any port 22 proto tcp
+sudo ufw allow from IP-RUNNER to any port 22 proto tcp
+sudo ufw enable
+```
+
+Per un livello in più puoi limitare anche il traffico in uscita: il server MCP deve raggiungere solo i sistemi di destinazione, il DNS, i repository dei pacchetti, GitHub e PyPI.
+
+**fail2ban.** Installalo e crea `/etc/fail2ban/jail.d/sshd.local`:
+
+```ini
+[sshd]
+enabled  = true
+backend  = systemd
+maxretry = 5
+findtime = 10m
+bantime  = 1h
+```
+
+Poi attivalo:
+
+```bash
+sudo systemctl enable --now fail2ban
+```
+
+**SELinux o AppArmor.** Lasciali attivi: su Fedora e RHEL `getenforce` deve rispondere `Enforcing`. In caso di problemi di accesso a file, ripristina i contesti con `restorecon` invece di disattivarli.
+
+**auditd.** Crea `/etc/audit/rules.d/mcp.rules`:
+
+```
+-w /etc/ssh/mcp_keys/ -p wa -k mcp-keys
+-w /etc/ssh/mcp_deploy_keys -p wa -k mcp-deploy-keys
+-w /etc/sudoers.d/ -p wa -k mcp-sudoers
+-w /etc/ssh/sshd_config.d/ -p wa -k sshd-config
+-w /usr/local/bin/mcp-gateway -p wa -k mcp-bin
+-w /usr/local/sbin/ -p wa -k mcp-bin
+# una riga per ogni server MCP (aggiungila quando crei il server)
+-w /opt/mcp-NOME/ -p wa -k mcp-NOME
+```
+
+Poi carica le regole:
+
+```bash
+sudo augenrules --load
+```
+
+**Monitoraggio.** Se hai un SIEM (per esempio Wazuh), installa il suo agente sul server MCP. Così accessi SSH, uso di sudo, eventi auditd e integrità dei file in `/opt/mcp-*`, `/etc/ssh` e `/etc/sudoers.d` arrivano alla console centrale.
+
+**Altro.** Tieni l'orario sincronizzato con chrony, disattiva i servizi non necessari e fai backup cifrati di `/opt/mcp-*`, `/etc/ssh/mcp_keys` e `/etc/ssh/mcp_deploy_keys`.
+
+### 3.3 Chiavi della pipeline
+
+La pipeline usa **due** chiavi SSH distinte. La chiave *plan* può solo leggere e calcolare il piano; la chiave *apply* può applicare le modifiche. Generale su una postazione di amministrazione, oppure temporaneamente sul server in una cartella protetta:
+
+```bash
+mkdir -m 700 ~/pipeline-keys && cd ~/pipeline-keys
+ssh-keygen -t ed25519 -N "" -C "mcp-plan"  -f mcp_plan
+ssh-keygen -t ed25519 -N "" -C "mcp-apply" -f mcp_apply
+```
+
+Le chiavi private verranno caricate nei secret di GitHub (paragrafo 5.3) e poi distrutte.
+
+### 3.4 Installazione della piattaforma
+
+Dalla cartella `server/` copiata sul server:
+
+```bash
+cd ~/mcp-setup
+sudo ./install-deploy.sh \
+  --plan-key  ~/pipeline-keys/mcp_plan.pub \
+  --apply-key ~/pipeline-keys/mcp_apply.pub \
+  --from "IP-RUNNER"
+```
+
+In `--from` indica gli indirizzi da cui si collega il runner. Se il runner è **sulla stessa macchina**, usa l'IP del server più `127.0.0.1`, per esempio `--from "192.168.10.40,127.0.0.1"`.
+
+Lo script:
+
+1. installa `mcp-admin` e `mcp-reconcile` in `/usr/local/sbin`;
+2. esegue `mcp-admin setup`, cioè crea il gruppo `mcp-users`, installa il gateway e il blocco sshd per gli utenti;
+3. crea l'utente `mcp-deploy`, senza password;
+4. scrive la regola sudo, che consente **solo** `mcp-reconcile plan` e `mcp-reconcile apply`;
+5. scrive `/etc/ssh/mcp_deploy_keys`, con ogni chiave vincolata al proprio comando e agli IP del runner;
+6. aggiunge il blocco sshd per `mcp-deploy`, lo verifica con `sshd -t` (annullando la modifica se non è valido) e ricarica sshd;
+7. alla fine stampa la chiave host del server.
+
+Lo script è rieseguibile. Rilancialo per aggiornare gli script dopo una modifica al repository, per sostituire le chiavi della pipeline o per cambiare l'IP del runner.
+
+### 3.5 Verifica
+
+Dalla macchina del runner, con la chiave plan:
+
+```bash
+echo '{}' | ssh -i ~/pipeline-keys/mcp_plan -o StrictHostKeyChecking=accept-new -T mcp-deploy@IP-SERVER-MCP
+```
+
+Il risultato atteso è:
+
+```
+### ❌ Stato non valido
+
+versione dello stato non supportata
+```
+
+Questo errore conferma che SSH, sudo e `mcp-reconcile` funzionano. Se invece compare `Permission denied (publickey)`, controlla `--from` e la chiave usata.
+
+---
+
+## 4. Installazione del runner GitHub Actions
+
+L'esempio è su **Fedora Server**. Il runner si collega **in uscita** a GitHub (HTTPS 443), quindi non richiede porte in ingresso.
+
+### 4.1 Prerequisiti e utente dedicato
+
+```bash
+sudo dnf install -y git curl tar python3 openssh-clients policycoreutils-python-utils
+sudo useradd --system --create-home --home-dir /opt/actions-runner \
+             --shell /bin/bash --comment "GitHub Actions runner" github-runner
+```
+
+L'utente del runner **non** deve avere sudo né appartenere a `wheel`.
+
+### 4.2 Download e registrazione
+
+Nel repository apri **Settings → Actions → Runners → New self-hosted runner** e seleziona *Linux x64*. Copia i comandi di download, che contengono la versione e lo sha256 aggiornati, ed eseguili come utente del runner:
+
+```bash
+sudo -iu github-runner
+cd /opt/actions-runner
+curl -o actions-runner-linux-x64-<VERSIONE>.tar.gz -L \
+  https://github.com/actions/runner/releases/download/v<VERSIONE>/actions-runner-linux-x64-<VERSIONE>.tar.gz
+echo "<SHA256>  actions-runner-linux-x64-<VERSIONE>.tar.gz" | sha256sum -c
+tar xzf actions-runner-linux-x64-<VERSIONE>.tar.gz
+exit
+
+sudo /opt/actions-runner/bin/installdependencies.sh
+```
+
+Registra il runner con il token mostrato nella stessa pagina (scade dopo circa un'ora) e con le etichette usate dai workflow:
+
+```bash
+sudo -iu github-runner
+cd /opt/actions-runner
+./config.sh --url https://github.com/TUA-ORG/NOME-REPO --token <TOKEN> \
+            --name mcp-runner-01 --labels mcp-plan,mcp-apply --work _work --unattended
+exit
+```
+
+Con due runner separati, che è la soluzione consigliata, registra il primo con `--labels mcp-plan` e il secondo con `--labels mcp-apply`.
+
+### 4.3 Servizio systemd e SELinux
+
+```bash
+cd /opt/actions-runner
+sudo ./svc.sh install github-runner
+sudo semanage fcontext --add --type initrc_exec_t '/opt/actions-runner/runsvc.sh'
+sudo restorecon -v /opt/actions-runner/runsvc.sh
+sudo ./svc.sh start
+sudo ./svc.sh status
+```
+
+Senza le due righe `semanage` e `restorecon`, SELinux impedisce a systemd di eseguire lo script del runner e il servizio fallisce con `status=203/EXEC`.
+
+Su GitHub il runner deve comparire come **Idle**. Per seguire i log:
+
+```bash
+journalctl -u 'actions.runner.*' -f
+```
+
+### 4.4 Sicurezza del runner
+
+Proteggi il runner come il server MCP:
+
+- aggiornamenti automatici e hardening SSH (paragrafo 3.2);
+- firewall senza porte in ingresso, salvo SSH di amministrazione;
+- in uscita solo HTTPS verso GitHub e SSH verso il server MCP;
+- agente del SIEM.
+
+Il runner si aggiorna da solo. Puoi valutare i runner effimeri (`--ephemeral`), che eseguono un solo job e poi si deregistrano. Usa il runner **solo** con il repository di configurazione.
+
+### 4.5 Rimozione
+
+```bash
+cd /opt/actions-runner
+sudo ./svc.sh stop && sudo ./svc.sh uninstall
+sudo -iu github-runner /opt/actions-runner/config.sh remove --token <TOKEN_DI_RIMOZIONE>
+```
+
+---
+
+## 5. Configurazione del repository GitHub
+
+### 5.1 Struttura
+
+```
+NOME-REPO/
+├── .github/
+│   ├── CODEOWNERS
+│   └── workflows/
+│       ├── mcp-plan.yml        # PR, notturno, manuale: validazione + piano
+│       └── mcp-deploy.yml      # merge su main: piano → approvazione → apply
+├── config/
+│   ├── servers.yaml            # server MCP
+│   └── users.yaml              # utenti e autorizzazioni
+├── keys/                       # chiavi pubbliche degli utenti (UTENTE.pub)
+├── scripts/
+│   ├── build_state.py
+│   └── ssh_run.sh
+└── server/                     # script da installare sul server MCP
+    ├── mcp-admin
+    ├── mcp-reconcile
+    └── install-deploy.sh
+```
+
+Il codice di tutti i file è nell'[Appendice A](#appendice-a--codice-sorgente).
+
+### 5.2 Environment `mcp-production`
+
+In **Settings → Environments → New environment** crea l'environment `mcp-production` e configuralo così:
+
+- **Required reviewers**: le persone o il team che approvano i deploy, con *Prevent self-review* attivo. Se il piano GitHub non lo consente, vedi il paragrafo 2.3.
+- **Deployment branches and tags**: *Selected branches*, solo `main`.
+
+### 5.3 Secret e variabili
+
+| Nome | Tipo | Dove | Contenuto |
+|---|---|---|---|
+| `MCP_PLAN_SSH_KEY` | secret | **repository** | chiave privata `mcp_plan`, comprese le righe BEGIN/END |
+| `MCP_APPLY_SSH_KEY` | secret | environment `mcp-production` | chiave privata `mcp_apply` |
+| credenziali dei sistemi | secret | environment `mcp-production` | un secret per ogni `{ secret: NOME }` usato nei YAML |
+| `MCP_SERVER_HOST` | variabile | repository | IP o nome del server MCP |
+| `MCP_SSH_KNOWN_HOSTS` | variabile | repository | riga known_hosts del server MCP |
+
+I secret si creano in **Settings → Secrets and variables → Actions**: scheda *Secrets* per quelli del repository, pagina dell'environment per quelli di `mcp-production`. Le variabili si creano nella scheda **Variables**.
+
+Con la CLI `gh`, da installare su una postazione di amministrazione e non sul runner:
+
+```bash
+gh secret set MCP_PLAN_SSH_KEY < mcp_plan
+gh secret set MCP_APPLY_SSH_KEY --env mcp-production < mcp_apply
+gh secret set NOME_SECRET --env mcp-production            # chiede il valore senza mostrarlo
+gh variable set MCP_SERVER_HOST --body "IP-SERVER-MCP"
+```
+
+**Riga known_hosts.** Ricavala con `ssh-keyscan`, così il nome iniziale coincide con `MCP_SERVER_HOST`:
+
+```bash
+ssh-keyscan -t ed25519 IP-SERVER-MCP 2>/dev/null
+```
+
+Prima di salvarla, confronta la fingerprint con quella reale del server. Le due righe devono coincidere:
+
+```bash
+ssh-keyscan -t ed25519 IP-SERVER-MCP 2>/dev/null | ssh-keygen -lf -     # dal runner
+sudo ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub                    # sul server
+```
+
+Poi salva la riga e distruggi le chiavi private:
+
+```bash
+gh variable set MCP_SSH_KNOWN_HOSTS --body "IP-SERVER-MCP ssh-ed25519 AAAA..."
+shred -u ~/pipeline-keys/mcp_plan ~/pipeline-keys/mcp_apply
+```
+
+Verifica infine che tutto sia al posto giusto:
+
+```bash
+gh secret list                         # deve contenere MCP_PLAN_SSH_KEY
+gh secret list --env mcp-production    # MCP_APPLY_SSH_KEY e le credenziali
+gh variable list                       # MCP_SERVER_HOST e MCP_SSH_KNOWN_HOSTS
+```
+
+### 5.4 Regole del branch `main` e CODEOWNERS
+
+In **Settings → Rules → Rulesets** (oppure *Branch protection*) crea per `main` queste regole:
+
+- pull request obbligatoria con almeno un'approvazione;
+- revisione obbligatoria dei **Code Owners**;
+- *Dismiss stale approvals* ai nuovi commit;
+- status check obbligatorio `plan`;
+- niente force push né cancellazione del branch;
+- regole valide anche per gli amministratori.
+
+Nel file `.github/CODEOWNERS` indica il team che deve approvare le modifiche a `config/`, `keys/`, `scripts/`, `server/` e `.github/`.
+
+### 5.5 Impostazioni di Actions
+
+In **Settings → Actions → General**:
+
+- *Workflow permissions*: *Read repository contents*;
+- consenti solo azioni di GitHub e verificate;
+- richiedi l'approvazione per i workflow delle PR da fork.
+
+Per maggiore sicurezza, fissa `actions/checkout` a uno SHA di commit.
+
+---
+
+## 6. Riferimento della configurazione dichiarativa
+
+I file in `config/` descrivono lo **stato voluto**. `mcp-reconcile` lo confronta con il server ed esegue solo le differenze. Tutto ciò che non è nei file viene riportato a quanto dichiarato: gli utenti non elencati vengono eliminati, e le modifiche manuali ai server gestiti vengono sovrascritte.
+
+### 6.1 `config/servers.yaml`
+
+```yaml
+policy:
+  max_user_deletions: 3        # l'apply si blocca se eliminerebbe più utenti di così
+
+servers:
+  NOME:
+    state: present             # present (predefinito) | absent
+    install: { ... }           # vedi sotto
+    command: ["{dir}/...", "argomento"]
+    env:
+      VARIABILE: valore
+      CREDENZIALE: { secret: NOME_SECRET_GITHUB }
+    files:
+      nomefile: { secret: NOME_SECRET_GITHUB }
+```
+
+| Campo | Significato |
+|---|---|
+| `state` | `absent` dismette il server: rimuove utente di servizio, gruppo e regola sudo, e conserva la cartella. Prima toglilo a tutti gli utenti |
+| `command` | comando che avvia il server MCP in modalità stdio. `{dir}` diventa `/opt/mcp-NOME` |
+| `env` | variabili scritte in `/opt/mcp-NOME/NOME.env`. Valori semplici oppure `{ secret: NOME }`, letto dai secret dell'environment `mcp-production` |
+| `files` | file creati in `/opt/mcp-NOME` con permessi `640 root:mcp-NOME`, per esempio file di password o certificati |
+
+I valori `true`/`false` e i numeri diventano stringhe (`"true"`, `"8006"`). Per valori come `0` o `yes`, meglio scriverli tra virgolette.
+
+**Metodi di installazione:**
+
+```yaml
+# 1) binario scaricato da una release (sha256 obbligatorio)
+install:
+  method: binary
+  url: https://…/nome-binario-linux-amd64
+  sha256: "<SHA256>"             # curl -sL <url> | sha256sum
+  name: nome-binario             # installato in {dir}/bin/nome-binario
+command: ["{dir}/bin/nome-binario", "--transport", "stdio"]
+
+# 2) pacchetto PyPI in un ambiente virtuale dedicato (versione obbligatoria)
+install:
+  method: pip
+  package: nome-pacchetto==<VERSIONE>     # sono ammessi anche gli extra: nome[extra]==<VERSIONE>
+  python: "3.13"
+command: ["{dir}/venv/bin/nome-comando"]
+
+# 3) nessuna installazione automatica (codice installato a mano in {dir})
+install:
+  method: none
+```
+
+L'installazione viene ripetuta solo quando cambia il blocco `install`. Il codice installato è di proprietà di root, quindi l'utente di servizio non può modificarlo.
+
+### 6.2 `config/users.yaml`
+
+```yaml
+users:
+  UTENTE:
+    servers: [NOME1, NOME2]      # almeno uno, tutti dichiarati in servers.yaml
+    expire: 2027-12-31           # facoltativo: dopo questa data la chiave non vale più
+    enabled: true                # false = sospeso (l'utente resta, l'accesso no)
+    key_file: keys/UTENTE.pub    # facoltativo, questo è il valore predefinito
+```
+
+I nomi utente usano minuscole, cifre, `_` e `-`, non possono iniziare con `mcp-` e non devono coincidere con utenti di sistema già esistenti.
+
+### 6.3 `keys/`
+
+Ogni file `UTENTE.pub` contiene **una sola riga**: la chiave pubblica dell'utente, senza opzioni davanti. La chiave privata non entra mai nel repository.
+
+### 6.4 Validazione locale
+
+Prima di aprire una PR puoi validare i file sul tuo PC:
+
+```bash
+sudo dnf install -y python3-pyyaml          # oppure: pip install pyyaml
+python3 scripts/build_state.py validate
+```
+
+L'output indica eventuali errori e l'elenco dei secret richiesti.
+
+---
+
+## 7. Operazioni di amministrazione
+
+### 7.1 Il flusso di una modifica
+
+```
+branch da main ─► modifica YAML/chiavi ─► PR ─► piano automatico ─► revisione CODEOWNERS
+     ─► merge su main ─► piano ─► ⏸ approvazione ─► apply ─► verifica
+```
+
+1. Parti sempre da `main` aggiornato:
+   ```bash
+   git checkout main && git pull && git checkout -b descrizione-modifica
+   ```
+2. Modifica i file, poi esegui la validazione locale (paragrafo 6.4).
+3. Apri la PR:
+   ```bash
+   git add … && git commit -m "…" && git push -u origin descrizione-modifica && gh pr create --fill
+   ```
+4. Leggi il **piano** nel riepilogo del job `plan`. Deve contenere **solo** le modifiche attese:
+
+   ```
+   ### Piano MCP — 4 modifiche
+
+   - 🟢 server `NOME`: creazione
+   - 🟢 server `NOME`: installazione pacchetto nome-pacchetto==1.2.3 (Python 3.13)
+   - 🟢 server `NOME`: configurazione (8 variabili, 0 file)
+   - 🟢 utente `UTENTE`: creazione con accesso a NOME
+   ```
+
+   Il significato delle icone: 🟢 creazione, 🟡 modifica, 🔴 eliminazione o revoca.
+5. Dopo la revisione, fai il merge su `main`.
+6. Nel run *MCP · deploy*, il job `apply` attende l'approvazione. Chi approva apre **Actions → run → Review deployments**, seleziona `mcp-production` e clicca **Approve and deploy**.
+7. Controlla l'esito nel riepilogo di `apply`: ogni riga deve avere ✅. Al primo errore l'applicazione si interrompe e le operazioni successive non vengono eseguite.
+
+### 7.2 Perché il deploy si fa solo da `main`
+
+La configurazione è dichiarativa: **il branch da cui si fa il deploy diventa la verità**. Un deploy da un branch vecchio annullerebbe le modifiche fatte nel frattempo, con il rischio di eliminare utenti e dismettere server. Per questo il deploy parte solo dal merge su `main`, e l'environment accetta solo `main`.
+
+Se devi sospendere temporaneamente i deploy automatici:
+
+```bash
+gh workflow disable "MCP · deploy"      # per riattivarlo: gh workflow enable "MCP · deploy"
+```
+
+In alternativa, aggiungi `[skip ci]` al messaggio del commit di merge.
+
+### 7.3 Aggiungere un server MCP
+
+1. **Sul sistema di destinazione**, crea un account dedicato con i permessi minimi, preferibilmente in sola lettura. Consenti le connessioni dal server MCP.
+2. **Su GitHub**, crea nell'environment `mcp-production` un secret per ogni credenziale.
+3. **Nel repository**, aggiungi il blocco in `config/servers.yaml` (capitolo 6) e autorizza gli utenti in `config/users.yaml`.
+4. Segui il flusso del paragrafo 7.1.
+5. **Verifica sul server:**
+   ```bash
+   sudo mcp-admin list
+   sudo -u mcp-NOME /opt/mcp-NOME/run.sh
+   ```
+   Nel secondo comando incolla la riga `initialize` del paragrafo 8.4: deve rispondere con `serverInfo`. Esci con Ctrl+C.
+6. Aggiungi la regola auditd per `/opt/mcp-NOME/` (paragrafo 3.2).
+
+Il capitolo 12 contiene esempi completi per Wazuh, UniFi e Proxmox.
+
+### 7.4 Aggiungere un utente
+
+1. L'utente genera la propria chiave e ti manda **solo** il file `.pub` (paragrafo 8.2).
+2. Salva la chiave in `keys/UTENTE.pub` e aggiungi la voce in `config/users.yaml`.
+3. Segui il flusso del paragrafo 7.1.
+4. Manda all'utente l'IP del server, il suo nome utente, i nomi dei server MCP autorizzati e la **fingerprint del server**, che ricavi con:
+   ```bash
+   sudo ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
+   ```
+
+### 7.5 Altre operazioni
+
+| Operazione | Cosa fare |
+|---|---|
+| Dare o togliere un server a un utente | modifica `servers:` dell'utente |
+| Sospendere un utente | `enabled: false` |
+| Deprovisioning | rimuovi la voce da `users.yaml` e il file `keys/UTENTE.pub` |
+| Chiave nuova (PC cambiato o perso) | sostituisci `keys/UTENTE.pub` |
+| Scadenza | aggiungi o modifica `expire` |
+| Aggiornare un server MCP | cambia `url` e `sha256`, oppure la versione in `package` |
+| Ruotare una credenziale | aggiorna il secret su GitHub, poi **Actions → MCP · deploy → Run workflow** (senza PR) |
+| Dismettere un server | toglilo a tutti gli utenti, poi imposta `state: absent` |
+| Eliminare molti utenti insieme | alza temporaneamente `policy.max_user_deletions` nella stessa PR |
+| Prendere in gestione un server creato a mano | dichiaralo con lo stesso nome: al primo apply compare "presa in gestione" e `run.sh` e `.env` vengono rigenerati |
+
+Ogni sessione attiva di un utente viene chiusa quando gli si revoca un server, gli si cambia la chiave o viene sospeso o eliminato.
+
+### 7.6 Emergenze
+
+Se una chiave è compromessa o un utente va bloccato subito, intervieni direttamente sul server:
+
+```bash
+sudo mcp-admin user-lock UTENTE
+```
+
+Subito dopo apri la PR (`enabled: false` o rimozione dell'utente). Senza la PR, il deploy successivo riattiverebbe l'utente.
+
+Per le credenziali di un sistema, revocale **sul sistema** (token, password), poi aggiorna il secret ed esegui il deploy.
+
+### 7.7 Controllo del drift
+
+Il workflow *MCP · validazione e piano* gira anche ogni notte. Se il piano notturno mostra modifiche senza che ci siano PR, qualcuno ha cambiato il server a mano. Individua chi con i log (capitolo 10) e decidi se riportare la modifica nei file YAML o lasciarla annullare dal deploy successivo.
+
+---
+
+## 8. Guida per l'utente finale
+
+Questo capitolo si può consegnare così com'è a chi deve usare la piattaforma.
+
+### 8.1 Installare Claude Code
+
+Su Linux e macOS usa l'installer nativo, che non richiede Node.js né permessi di amministratore:
 
 ```bash
 curl -fsSL https://claude.ai/install.sh | bash
@@ -79,88 +757,285 @@ claude --version
 claude              # primo avvio: login nel browser
 ```
 
-> Se in passato avevi provato l'installazione con npm, vedi la [sezione 9](#9-risoluzione-dei-problemi).
+Per Windows e per altri metodi di installazione, consulta la documentazione di Claude Code.
+
+### 8.2 Generare la propria chiave SSH
+
+Su Linux o macOS:
+
+```bash
+ssh-keygen -t ed25519 -C "UTENTE@mcp" -f ~/.ssh/mcp_UTENTE
+cat ~/.ssh/mcp_UTENTE.pub
+```
+
+Su Windows (PowerShell):
+
+```powershell
+ssh-keygen -t ed25519 -C "UTENTE@mcp" -f $env:USERPROFILE\.ssh\mcp_UTENTE
+Get-Content $env:USERPROFILE\.ssh\mcp_UTENTE.pub
+```
+
+Lascia la passphrase **vuota**: Claude Code usa SSH senza interazione. In alternativa puoi impostarla e caricare la chiave in `ssh-agent` prima di avviare Claude Code.
+
+Invia all'amministratore **solo** la riga del file `.pub`. Il file senza estensione è la chiave privata e non deve mai lasciare il tuo PC.
+
+### 8.3 Configurare SSH
+
+Aggiungi al file `~/.ssh/config` i dati ricevuti dall'amministratore:
+
+```
+Host mcp
+    HostName IP-SERVER-MCP
+    User UTENTE
+    IdentityFile ~/.ssh/mcp_UTENTE
+    IdentitiesOnly yes
+    BatchMode yes
+    ConnectTimeout 10
+```
+
+### 8.4 Primo collegamento e registrazione
+
+Per il primo collegamento, che serve ad accettare la fingerprint del server:
+
+```bash
+ssh -o BatchMode=no -T mcp NOME
+```
+
+Confronta la fingerprint con quella ricevuta dall'amministratore e rispondi `yes`. Se il comando resta in attesa senza errori, l'accesso funziona: esci con Ctrl+C.
+
+Per una verifica completa, mentre il comando è in attesa incolla questa riga e premi Invio:
+
+```json
+{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}
+```
+
+La risposta deve contenere `serverInfo`.
+
+Registra poi ogni server MCP autorizzato in Claude Code:
+
+```bash
+claude mcp add --scope user NOME -- ssh -T mcp NOME
+claude mcp list
+```
+
+In Claude Code, il comando `/mcp` mostra lo stato delle connessioni. L'ultimo argomento (`NOME`) è il nome del server MCP richiesto al gateway: non servono percorsi né comandi.
+
+### 8.5 Messaggi che puoi incontrare
+
+| Messaggio | Significato |
+|---|---|
+| `Accesso interattivo non consentito` | hai aperto SSH senza indicare il server MCP: è normale, l'accesso alla shell non è previsto |
+| `Non sei autorizzato al server MCP 'NOME'` | chiedi all'amministratore di abilitarti |
+| `Permission denied (publickey)` | chiave sbagliata, account sospeso o chiave scaduta |
+| `connection timed out after 30000ms` | vedi il capitolo 11 |
+
+### 8.6 Rimuovere un server da Claude Code
+
+```bash
+claude mcp list
+claude mcp remove NOME --scope user
+```
 
 ---
 
-## 4. Server MCP: preparazione di base
+## 9. Gestione manuale con mcp-admin
 
-> Le sezioni 4–8 descrivono la configurazione **a utente singolo**. Se il server sarà usato da più persone o ospiterà più server MCP, segui la [sezione 11](#11-sicurezza-più-server-mcp-e-più-utenti), che separa utenti, credenziali e permessi.
+`mcp-admin` è lo strumento che la pipeline usa dietro le quinte. Si usa direttamente in tre casi: per **consultare** lo stato, per le **emergenze** e sulle installazioni **senza pipeline**.
 
-Crea un utente di sistema dedicato e le cartelle:
+> Con la pipeline attiva, le modifiche fatte a mano con `mcp-admin` su server e utenti dichiarati nei YAML vengono annullate al deploy successivo.
 
-```bash
-sudo useradd -m -s /bin/bash mcp
-sudo mkdir -p /opt/mcp-wazuh /opt/mcp-unifi
-sudo chown mcp:mcp /opt/mcp-wazuh /opt/mcp-unifi
-```
+### 9.1 Comandi
 
-Imposta una password temporanea, che servirà solo per copiare la chiave SSH:
+| Comando | Funzione |
+|---|---|
+| `mcp-admin setup` | configurazione iniziale (gruppo `mcp-users`, gateway, blocco sshd) |
+| `mcp-admin server-add NOME` | crea utente di servizio, cartella, gruppo e regola sudo |
+| `mcp-admin server-del NOME` | rimuove regola sudo, gruppo e utente di servizio, e conserva la cartella |
+| `mcp-admin user-add UTENTE --servers a,b [--pubkey FILE] [--expire AAAAMMGG]` | crea un utente |
+| `mcp-admin user-grant UTENTE NOME` / `user-revoke UTENTE NOME` | autorizza o revoca un server MCP |
+| `mcp-admin user-rotate-key UTENTE [--pubkey FILE] [--expire AAAAMMGG]` | sostituisce la chiave |
+| `mcp-admin user-lock UTENTE` / `user-unlock UTENTE` | sospende o riattiva l'accesso |
+| `mcp-admin user-del UTENTE` | elimina l'utente |
+| `mcp-admin list` | mostra server, utenti, autorizzazioni, stato e scadenza delle chiavi |
 
-```bash
-sudo passwd mcp
-```
+Per indicare nelle istruzioni stampate l'IP del server invece del nome host, avvia i comandi con `sudo MCP_SERVER_HOST=IP-SERVER-MCP mcp-admin …`.
+
+### 9.2 Installazione senza pipeline
+
+1. Installa lo script ed esegui il setup:
+   ```bash
+   sudo install -m 700 -o root -g root mcp-admin /usr/local/sbin/mcp-admin
+   sudo mcp-admin setup
+   ```
+2. Crea il server MCP:
+   ```bash
+   sudo mcp-admin server-add NOME
+   ```
+3. Installa il codice in `/opt/mcp-NOME`. Metti le credenziali in `/opt/mcp-NOME/NOME.env`, con proprietario `mcp-NOME` e permessi `600`. Completa `/opt/mcp-NOME/run.sh`, che viene creato come modello:
+   ```bash
+   #!/bin/bash
+   set -a
+   source /opt/mcp-NOME/NOME.env
+   set +a
+   exec /opt/mcp-NOME/venv/bin/nome-comando
+   ```
+4. Prova il server:
+   ```bash
+   sudo -u mcp-NOME /opt/mcp-NOME/run.sh
+   ```
+5. Crea l'utente:
+   ```bash
+   sudo mcp-admin user-add UTENTE --servers NOME --pubkey /tmp/UTENTE.pub
+   ```
+
+Senza `--pubkey`, `user-add` genera una chiave ed25519 in memoria (`/dev/shm`) e la mostra **una sola volta** a terminale, con i comandi `claude mcp add` già pronti, poi la distrugge. Trasmettila all'utente su un canale sicuro e cancella lo scrollback del terminale. Quando possibile, però, preferisci la chiave generata dall'utente.
 
 ---
 
-## 5. Accesso SSH senza password dal Fedora
+## 10. Monitoraggio, audit e verifiche di sicurezza
 
-Claude Code non può digitare password, quindi l'accesso deve funzionare con le chiavi.
-
-Sul **Fedora**:
+### 10.1 Registri
 
 ```bash
-ssh-keygen -t ed25519            # solo se non hai già una chiave
-ssh-copy-id mcp@IP-SERVER-MCP
-ssh mcp@IP-SERVER-MCP            # primo accesso: rispondi "yes" alla fingerprint
+journalctl -t mcp-gateway --since today       # chi ha usato quale server MCP, tentativi negati
+journalctl -t mcp-reconcile --since today     # esiti degli apply
+journalctl _COMM=sudo --since today           # esecuzioni di run.sh e reconcile
+journalctl -u sshd --since today              # accessi SSH (Debian/Ubuntu: -u ssh)
+sudo ausearch -k mcp-keys -i                  # modifiche alle chiavi degli utenti
+sudo ausearch -k mcp-sudoers -i               # modifiche alle regole sudo
 ```
 
-Verifica che non venga chiesto nulla:
+Voci tipiche del gateway:
+
+```
+mcp-gateway: ALLOW user=alice from=192.168.10.20 server=wazuh
+mcp-gateway: DENY user=bob from=192.168.10.31 server=proxmox reason=not-authorized
+```
+
+Su GitHub, la cronologia dei commit, le PR, le approvazioni degli environment e i riepiloghi dei job documentano **chi** ha cambiato **cosa** e **chi** l'ha approvato.
+
+### 10.2 Verifiche periodiche
+
+Dal PC di un utente, questi tentativi **devono fallire**:
 
 ```bash
-ssh -o BatchMode=yes -T mcp@IP-SERVER-MCP echo ok
+ssh mcp                                  # "Accesso interattivo non consentito"
+ssh mcp 'NOME; id'                       # "Nome del server MCP non valido"
+ssh mcp NOME-NON-AUTORIZZATO             # "Non sei autorizzato…"
+ssh -N -L 8080:127.0.0.1:22 mcp          # port forwarding rifiutato
 ```
 
-Deve rispondere `ok`. A quel punto, se vuoi, puoi bloccare la password dell'utente, lasciando attivo il solo accesso con chiave:
+Sul server MCP:
 
 ```bash
-sudo passwd -l mcp
+# un utente non può leggere le credenziali
+sudo -u UTENTE cat /opt/mcp-NOME/NOME.env                    # Permission denied
+
+# configurazione sshd effettiva per un utente e per la pipeline
+sudo sshd -T -C user=UTENTE,host=client,addr=IP-CLIENT | grep -Ei 'forcecommand|disableforwarding|permittty'
+sudo sshd -T -C user=mcp-deploy,host=runner,addr=IP-RUNNER | grep -Ei 'authorizedkeysfile|permittty'
+
+# stato generale
+sudo mcp-admin list
 ```
+
+Una volta al mese conviene anche:
+
+- controllare in `mcp-admin list` le chiavi **scadute** o in scadenza;
+- verificare che gli account sui sistemi di destinazione abbiano ancora i soli permessi previsti;
+- ruotare le credenziali secondo la politica aziendale (paragrafo 7.5).
 
 ---
 
-## 6. Wazuh
+## 11. Risoluzione dei problemi
 
-### 6.1 Utente API di Wazuh in sola lettura
+### 11.1 Client e Claude Code
 
-Nella dashboard di Wazuh vai su **Server management → Security → Users**:
+| Sintomo | Causa e soluzione |
+|---|---|
+| `npm error code EACCES` installando Claude Code | npm prova a scrivere in `/usr/local`. Non usare `sudo npm`: usa l'installer nativo (paragrafo 8.1). Per rimuovere la vecchia installazione: `npm uninstall -g @anthropic-ai/claude-code` |
+| `claude: File o directory non esistente` dopo aver cambiato metodo di installazione | bash ricorda il vecchio percorso: esegui `hash -r` o apri un nuovo terminale |
+| `connection timed out after 30000ms` | SSH attende un input che Claude Code non può dare. Esegui `ssh -o BatchMode=yes -T mcp NOME` e leggi l'errore |
+| `Host key verification failed` | primo collegamento mai fatto: esegui `ssh -o BatchMode=no -T mcp NOME` e accetta la fingerprint |
+| `Permission denied (publickey)` | chiave errata o permessi sbagliati (`chmod 600 ~/.ssh/mcp_UTENTE`), utente sospeso o chiave scaduta: controlla con `sudo mcp-admin list` |
+| `Server MCP 'NOME' non ancora configurato` | `run.sh` è ancora il modello: completa la configurazione del server |
+| Il server parte ma gli strumenti restituiscono errori | problema tra server MCP e sistema di destinazione: prova `sudo -u mcp-NOME /opt/mcp-NOME/run.sh` sul server e controlla rete, credenziali e certificati |
 
-1. Crea l'utente `mcp_readonly` con una password robusta.
-2. Assegnagli il ruolo **`readonly`**.
+Per i dettagli della connessione MCP avvia Claude Code con `claude --debug`. Per allungare il tempo di attesa: `MCP_TIMEOUT=60000 claude`.
 
-### 6.2 Utente dell'Indexer in sola lettura
+### 11.2 Pipeline
 
-L'Indexer è basato su OpenSearch. Servono tre elementi: un **ruolo**, un **utente interno** e una **mappatura** tra i due.
+| Messaggio nel job | Causa e soluzione |
+|---|---|
+| `MCP_SSH_KEY mancante` | manca il secret `MCP_PLAN_SSH_KEY` a livello di **repository** (spesso è stato creato nell'environment), oppure la PR arriva da un fork. Per `apply`, manca `MCP_APPLY_SSH_KEY` nell'environment |
+| `MCP_SSH_KNOWN_HOSTS mancante` / `MCP_SERVER_HOST mancante` | mancano le **variabili** del repository (scheda *Variables*, non *Secrets*) |
+| `Host key verification failed` | la riga known_hosts non corrisponde: il nome iniziale deve essere identico a `MCP_SERVER_HOST`. Rigenera la riga con `ssh-keyscan` |
+| `Permission denied (publickey)` | IP del runner non incluso in `--from` (runner sulla stessa macchina: aggiungi l'IP del server e `127.0.0.1`), oppure chiave diversa da quella installata. Riesegui `install-deploy.sh` |
+| `Errori nella configurazione: …` | errore nei YAML o nelle chiavi: il messaggio indica file e campo |
+| `secret mancanti nell'environment GitHub: …` | crea i secret indicati in `mcp-production` |
+| `mcp-admin setup non eseguito sul server` | esegui `install-deploy.sh` (capitolo 3) |
+| `sha256 non corrispondente` | lo sha256 nel YAML non corrisponde al file scaricato: ricalcolalo con `curl -sL URL \| sha256sum` e verifica la fonte |
+| `/usr/local/bin/uv non trovato` | installa `uv` (paragrafo 3.1) |
+| `il piano elimina N utenti (limite …)` | l'eliminazione è voluta? Alza `policy.max_user_deletions` nella stessa PR |
+| `l'utente di sistema 'X' esiste ma non è un utente MCP` | scegli un altro nome utente |
+| `un'altra esecuzione di mcp-reconcile è in corso` | attendi la fine dell'altra esecuzione e rilancia |
+| Il job `apply` resta in attesa | serve l'approvazione: **Review deployments** |
+| Il job `apply` viene rifiutato per il branch | l'environment accetta solo `main`: fai il deploy dal merge |
+| Il runner non prende i job | etichette diverse da quelle nel workflow (`mcp-plan`, `mcp-apply`), oppure runner offline: `sudo ./svc.sh status` |
+| Il servizio del runner fallisce con `203/EXEC` | SELinux: applica `semanage` e `restorecon` (paragrafo 4.3) |
+| `gh: comando non trovato` | installa `gh` sulla postazione di amministrazione (`sudo dnf install gh`, poi `gh auth login`) |
 
-#### Metodo A: dalla dashboard
+Per rilanciare un job fallito: pagina del run → **Re-run jobs → Re-run failed jobs**.
 
-Vai su **☰ → Indexer management → Security** (nelle versioni più vecchie: *OpenSearch Plugins → Security*).
+### 11.3 Server MCP
 
-1. **Roles → Create role** `mcp_alerts_readonly`
-   - Cluster permissions: `cluster_composite_ops_ro`
-   - Index: `wazuh-alerts-*`, `wazuh-states-vulnerabilities-*`
-   - Index permissions: `read`
-2. **Internal users → Create internal user** `mcp_indexer`, senza backend roles.
+| Sintomo | Causa e soluzione |
+|---|---|
+| `Connection timed out` dal server MCP verso un sistema | firewall sul sistema di destinazione o in mezzo |
+| `Connection refused` | il servizio ascolta solo in locale sul sistema di destinazione |
+| Errori TLS | certificato autofirmato: imposta la variabile di verifica SSL del server MCP, oppure aggiungi la CA del sistema a quelle attendibili del server MCP |
+| `sshd -t` fallisce dopo una modifica | gli script annullano da soli le proprie modifiche; per quelle manuali correggi il file indicato prima di ricaricare |
+
+---
+
+## 12. Configurazione dei server MCP: Wazuh, UniFi, Proxmox
+
+Questo capitolo applica la procedura del paragrafo 7.3 a tre sistemi concreti. Ogni sezione descrive gli stessi quattro passaggi: account sul sistema, rete, secret su GitHub e blocco da inserire in `config/servers.yaml`.
+
+| Server MCP | Progetto | Installazione | Accesso |
+|---|---|---|---|
+| `wazuh` | [gbrigandi/mcp-server-wazuh](https://github.com/gbrigandi/mcp-server-wazuh) | binario (Rust) | API del manager + Indexer, sola lettura |
+| `unifi` | [sirkirby/unifi-mcp](https://github.com/sirkirby/unifi-mcp), pacchetto `unifi-network-mcp` | pip | amministratore locale *View Only* |
+| `proxmox` | [GethosTheWalrus/proxmox-mcp](https://github.com/GethosTheWalrus/proxmox-mcp), pacchetto `proxmox-mcp-server` | pip | API token con ruolo `PVEAuditor` e modalità sola lettura |
+
+Prima di ogni installazione controlla l'ultima versione disponibile di ciascun progetto e fissala nel YAML.
+
+### 12.1 Wazuh
+
+#### Account API del manager
+
+Nella dashboard di Wazuh vai su **Server management → Security → Users**. Crea l'utente `mcp_readonly` e assegnagli il ruolo **`readonly`**.
+
+#### Account dell'Indexer
+
+L'Indexer è basato su OpenSearch: servono un **ruolo**, un **utente interno** e una **mappatura** tra i due.
+
+Per crearli dalla dashboard, apri **☰ → Indexer management → Security** (nelle versioni meno recenti *OpenSearch Plugins → Security*) e procedi così:
+
+1. **Roles → Create role**, con nome `mcp_alerts_readonly`:
+   - *Cluster permissions*: `cluster_composite_ops_ro`;
+   - *Index*: `wazuh-alerts-*`, `wazuh-states-vulnerabilities-*`;
+   - *Index permissions*: `read`.
+2. **Internal users → Create internal user**, con nome `mcp_indexer`, senza backend roles.
 3. Nel ruolo `mcp_alerts_readonly` apri **Mapped users → Manage mapping** e aggiungi `mcp_indexer`.
 
-#### Metodo B: da riga di comando (sulla macchina Wazuh)
+In alternativa, dalla riga di comando della macchina Wazuh:
 
 ```bash
 read -s -p "Password admin indexer: " ADMIN_PW; echo
 read -s -p "Nuova password per mcp_indexer: " MCP_PW; echo
 IDX=https://localhost:9200
 
-# Ruolo
 curl -k -u "admin:$ADMIN_PW" -X PUT "$IDX/_plugins/_security/api/roles/mcp_alerts_readonly" \
   -H 'Content-Type: application/json' -d '{
   "cluster_permissions": ["cluster_composite_ops_ro"],
@@ -169,41 +1044,35 @@ curl -k -u "admin:$ADMIN_PW" -X PUT "$IDX/_plugins/_security/api/roles/mcp_alert
     "allowed_actions": ["read"]
   }]
 }'
-
-# Utente
 curl -k -u "admin:$ADMIN_PW" -X PUT "$IDX/_plugins/_security/api/internalusers/mcp_indexer" \
   -H 'Content-Type: application/json' -d "{\"password\": \"$MCP_PW\"}"
-
-# Mappatura
 curl -k -u "admin:$ADMIN_PW" -X PUT "$IDX/_plugins/_security/api/rolesmapping/mcp_alerts_readonly" \
   -H 'Content-Type: application/json' -d '{"users": ["mcp_indexer"]}'
 ```
 
-Verifica: il primo comando deve **riuscire**, gli altri due devono fallire con **403**.
+Per verificare, la lettura deve **riuscire** e le scritture devono fallire con **403**:
 
 ```bash
 curl -k -u "mcp_indexer:$MCP_PW" "$IDX/wazuh-alerts-*/_search?size=1&pretty"   # OK
 curl -k -u "mcp_indexer:$MCP_PW" -X PUT "$IDX/test-mcp"                         # 403
-curl -k -u "mcp_indexer:$MCP_PW" -X DELETE "$IDX/wazuh-alerts-*"                # 403
-
 unset ADMIN_PW MCP_PW
 ```
 
-> L'indice `wazuh-states-vulnerabilities-*` contiene i dati delle vulnerabilità da Wazuh 4.8 in poi. Nelle versioni precedenti puoi ometterlo.
+L'indice `wazuh-states-vulnerabilities-*` esiste da Wazuh 4.8 in poi.
 
-### 6.3 Rete: Wazuh su una macchina separata
+#### Rete
 
-Sulla **macchina Wazuh**, verifica che i servizi ascoltino anche sulla rete e non solo in locale:
+Il server MCP deve raggiungere l'API del manager (**55000**) e l'Indexer (**9200**).
+
+Sulla macchina Wazuh, controlla che i servizi ascoltino sulla rete e non solo in locale:
 
 ```bash
 sudo ss -tlnp | grep -E '55000|9200'
 ```
 
-Se l'Indexer ascolta solo su `127.0.0.1:9200`, imposta `network.host` in `/etc/wazuh-indexer/opensearch.yml` con l'IP della macchina, poi riavvia con `sudo systemctl restart wazuh-indexer`. L'IP deve corrispondere a quello presente nei certificati dell'Indexer.
+Se vedi `127.0.0.1:9200`, imposta `network.host` in `/etc/wazuh-indexer/opensearch.yml` con l'IP della macchina, coerente con i certificati dell'Indexer, poi riavvia `wazuh-indexer`.
 
-Apri le porte **solo verso il server MCP**.
-
-Con firewalld:
+Apri le porte solo verso il server MCP:
 
 ```bash
 sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="IP-SERVER-MCP" port port="55000" protocol="tcp" accept'
@@ -211,643 +1080,172 @@ sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address
 sudo firewall-cmd --reload
 ```
 
-Con ufw:
+Dal server MCP verifica la connessione:
 
 ```bash
-sudo ufw allow from IP-SERVER-MCP to any port 55000 proto tcp
-sudo ufw allow from IP-SERVER-MCP to any port 9200 proto tcp
+curl -k -u mcp_readonly:PASSWORD -X POST "https://IP-WAZUH:55000/security/user/authenticate?raw=true"   # token JWT
+curl -k -u mcp_indexer:PASSWORD "https://IP-WAZUH:9200/wazuh-alerts-*/_search?size=1&pretty"          # un alert
 ```
 
-Dal **server MCP**, verifica la connessione:
+#### Secret (environment `mcp-production`)
+
+`WAZUH_API_USERNAME`, `WAZUH_API_PASSWORD`, `WAZUH_INDEXER_USERNAME`, `WAZUH_INDEXER_PASSWORD`.
+
+#### Configurazione
+
+```yaml
+  wazuh:
+    install:
+      method: binary
+      url: https://github.com/gbrigandi/mcp-server-wazuh/releases/download/<VERSIONE>/mcp-server-wazuh-linux-amd64
+      sha256: "<SHA256>"
+      name: mcp-server-wazuh
+    command: ["{dir}/bin/mcp-server-wazuh", "--transport", "stdio"]
+    env:
+      WAZUH_API_HOST: IP-WAZUH
+      WAZUH_API_PORT: 55000
+      WAZUH_API_USERNAME: { secret: WAZUH_API_USERNAME }
+      WAZUH_API_PASSWORD: { secret: WAZUH_API_PASSWORD }
+      WAZUH_INDEXER_HOST: IP-WAZUH
+      WAZUH_INDEXER_PORT: 9200
+      WAZUH_INDEXER_USERNAME: { secret: WAZUH_INDEXER_USERNAME }
+      WAZUH_INDEXER_PASSWORD: { secret: WAZUH_INDEXER_PASSWORD }
+      WAZUH_VERIFY_SSL: "false"
+      RUST_LOG: warn
+```
+
+Scegli la release dalla pagina *Releases* del progetto e calcola lo sha256 con `curl -sL URL | sha256sum`. Se Wazuh gira sullo stesso host del server MCP, usa `localhost`.
+
+`WAZUH_VERIFY_SSL: "false"` disattiva il controllo dei certificati. Per attivarlo, aggiungi il `root-ca.pem` di Wazuh alle CA del server MCP e imposta `"true"`.
+
+Esempi di richieste da provare in Claude Code: *"mostrami gli ultimi alert critici"*, *"quali agenti sono disconnessi?"*, *"vulnerabilità critiche dell'agente X"*.
+
+### 12.2 UniFi (UDM Pro)
+
+#### Account
+
+Nella console UniFi, in **Admins & Users**, crea un **amministratore locale** `mcp_viewer` con ruolo **View Only** per Network. Non usare un account Ubiquiti SSO cloud. Il server MCP non supporta account con **MFA/2FA**, quindi questo account dedicato deve esserne privo: compensa con password lunga, permessi minimi e accesso consentito solo dal server MCP.
+
+#### Rete
+
+Il server MCP deve raggiungere il UDM Pro sulla porta **443**:
 
 ```bash
-# API del manager: deve restituire un token JWT
-curl -k -u mcp_readonly:PASSWORD -X POST "https://IP-WAZUH:55000/security/user/authenticate?raw=true"
-
-# Indexer: deve restituire un alert
-curl -k -u mcp_indexer:PASSWORD "https://IP-WAZUH:9200/wazuh-alerts-*/_search?size=1&pretty"
+curl -k -I https://IP-UDM
 ```
 
-- *Connection timed out*: il problema è il firewall.
-- *Connection refused*: il servizio ascolta solo in locale.
+Se il server MCP è in un'altra VLAN, verifica le regole firewall del UDM.
 
-### 6.4 Installazione del server MCP di Wazuh
+#### Secret (environment `mcp-production`)
 
-Sul **server MCP**:
+`UNIFI_USERNAME`, `UNIFI_PASSWORD`.
+
+#### Configurazione
+
+```yaml
+  unifi:
+    install:
+      method: pip
+      package: unifi-network-mcp==<VERSIONE>
+      python: "3.13"
+    command: ["{dir}/venv/bin/unifi-network-mcp"]
+    env:
+      UNIFI_HOST: IP-UDM
+      UNIFI_USERNAME: { secret: UNIFI_USERNAME }
+      UNIFI_PASSWORD_FILE: "{dir}/password"
+      UNIFI_VERIFY_SSL: "false"
+    files:
+      password: { secret: UNIFI_PASSWORD }
+```
+
+La password viene scritta in un file (`640 root:mcp-unifi`) invece che in una variabile d'ambiente. Il server MCP la legge tramite `UNIFI_PASSWORD_FILE`. `UNIFI_VERIFY_SSL: "false"` serve per il certificato autofirmato del UDM.
+
+Il progetto nasconde di default i segreti nelle risposte (password Wi-Fi, chiavi VPN), e ogni modifica passa da un'anteprima con conferma. Con un account *View Only*, però, le modifiche sono comunque bloccate alla fonte.
+
+Esempi di richieste: *"mostrami i client connessi sulla VLAN ospiti"*, *"fai un audit delle regole firewall"*.
+
+### 12.3 Proxmox VE
+
+#### Account e token
+
+Sul nodo Proxmox, come root:
 
 ```bash
-sudo -iu mcp
-cd /opt/mcp-wazuh
-
-curl -LO https://github.com/gbrigandi/mcp-server-wazuh/releases/latest/download/mcp-server-wazuh-linux-amd64
-chmod +x mcp-server-wazuh-linux-amd64
-mv mcp-server-wazuh-linux-amd64 mcp-server-wazuh
+pveum user add mcp@pve --comment "Server MCP (sola lettura)"
+pveum acl modify / --users mcp@pve --roles PVEAuditor
+pveum user token add mcp@pve mcp --privsep 1
+pveum acl modify / --tokens 'mcp@pve!mcp' --roles PVEAuditor
 ```
 
-> Se il download diretto non funziona, scarica il binario dalla pagina **Releases** del repository. Controlla l'architettura del server con `uname -m`.
+Il valore del token viene mostrato **una sola volta**. Con `--privsep 1` il token ha permessi propri, per questo serve la seconda ACL. La protezione è su tre livelli: il ruolo `PVEAuditor`, la modalità sola lettura del server MCP e la chiamata API generica disattivata.
 
-### 6.5 Configurazione
+#### Rete
 
-`/opt/mcp-wazuh/wazuh.env`:
+Il server MCP deve raggiungere l'API di Proxmox sulla porta **8006**. Se il firewall del datacenter è attivo, consenti la porta dall'IP del server MCP.
+
+#### Secret (environment `mcp-production`)
 
 ```bash
-WAZUH_API_HOST=IP-WAZUH
-WAZUH_API_PORT=55000
-WAZUH_API_USERNAME=mcp_readonly
-WAZUH_API_PASSWORD=la_password_api
-WAZUH_INDEXER_HOST=IP-WAZUH
-WAZUH_INDEXER_PORT=9200
-WAZUH_INDEXER_USERNAME=mcp_indexer
-WAZUH_INDEXER_PASSWORD=la_password_indexer
-WAZUH_VERIFY_SSL=false
-RUST_LOG=warn
+gh secret set PROXMOX_USER --env mcp-production --body "mcp@pve"
+gh secret set PROXMOX_TOKEN_NAME --env mcp-production --body "mcp"
+gh secret set PROXMOX_TOKEN_VALUE --env mcp-production
 ```
 
-`/opt/mcp-wazuh/run.sh`:
+#### Configurazione
 
-```bash
-#!/bin/bash
-set -a
-source /opt/mcp-wazuh/wazuh.env
-set +a
-exec /opt/mcp-wazuh/mcp-server-wazuh --transport stdio
+```yaml
+  proxmox:
+    install:
+      method: pip
+      package: proxmox-mcp-server==<VERSIONE>
+      python: "3.13"
+    command: ["{dir}/venv/bin/proxmox-mcp-server"]
+    env:
+      PROXMOX_HOST: IP-PROXMOX
+      PROXMOX_PORT: 8006
+      PROXMOX_USER: { secret: PROXMOX_USER }
+      PROXMOX_TOKEN_NAME: { secret: PROXMOX_TOKEN_NAME }
+      PROXMOX_TOKEN_VALUE: { secret: PROXMOX_TOKEN_VALUE }
+      PROXMOX_VERIFY_SSL: "0"
+      PROXMOX_READ_ONLY: "true"
+      PROXMOX_DISABLE_RAW_API: "true"
 ```
 
-Permessi:
+Con `PROXMOX_READ_ONLY` sono consentite solo chiamate GET. Con `PROXMOX_DISABLE_RAW_API` viene disattivato lo strumento di chiamata API arbitraria.
 
-```bash
-chmod 600 /opt/mcp-wazuh/wazuh.env
-chmod 700 /opt/mcp-wazuh/run.sh
+Il server espone diverse centinaia di strumenti. Se occupano troppo contesto in Claude Code, attiva l'instradamento semantico: usa `package: proxmox-mcp-server[router]==<VERSIONE>` e aggiungi `TOOL_ROUTING: "true"`. Il client vedrà solo pochi strumenti, che caricano gli altri su richiesta.
+
+**Rotazione del token:**
+
+1. crea un nuovo token con la sua ACL;
+2. aggiorna `PROXMOX_TOKEN_NAME` e `PROXMOX_TOKEN_VALUE`;
+3. esegui **Run workflow** su *MCP · deploy* e approva;
+4. elimina il vecchio token con `pveum user token remove mcp@pve NOME_VECCHIO`.
+
+Esempi di richieste: *"elenca VM e container con il loro stato"*, *"quanto spazio resta sugli storage?"*, *"quali backup sono falliti questa settimana?"*.
+
+### 12.4 Esempio completo di `users.yaml`
+
+```yaml
+users:
+  alice:
+    servers: [wazuh, unifi]
+    expire: 2027-12-31
+  bob:
+    servers: [wazuh]
+  giorgio:
+    servers: [proxmox]
 ```
-
-> **SSL:** `WAZUH_VERIFY_SSL=false` disattiva il controllo dei certificati. Per maggiore sicurezza, aggiungi il `root-ca.pem` di Wazuh alle CA di sistema del server MCP e imposta `true`.
 
 ---
 
-## 7. UniFi / UDM Pro
+## Appendice A — Codice sorgente
 
-### 7.1 Account dedicato sul UDM Pro
+Questo è il codice dei file del repository di configurazione. I file `config/servers.yaml` e `config/users.yaml` sono descritti nei capitoli 6 e 12.
 
-Nella console UniFi (**Admins & Users**) crea un **amministratore locale**:
+### A.1 mcp-admin
 
-- nome: `mcp_viewer`;
-- ruolo **View Only** per Network;
-- **non** usare un account Ubiquiti SSO cloud;
-- **senza MFA/2FA**, che per questo account non è supportata.
-
-### 7.2 Installazione
-
-Sul **server MCP**:
-
-```bash
-sudo -iu mcp
-
-curl -LsSf https://astral.sh/uv/install.sh | sh
-source ~/.bashrc
-
-uv tool install --python 3.13 unifi-network-mcp
-which unifi-network-mcp     # es. /home/mcp/.local/bin/unifi-network-mcp
-```
-
-Per gli aggiornamenti futuri: `uv tool upgrade unifi-network-mcp`.
-
-### 7.3 Configurazione
-
-Salva la password in un file, senza lasciarla nella cronologia della shell:
-
-```bash
-read -s -p "Password mcp_viewer: " PW; echo
-printf '%s' "$PW" > /opt/mcp-unifi/password
-unset PW
-```
-
-`/opt/mcp-unifi/unifi.env`:
-
-```bash
-UNIFI_HOST=IP-UDM-PRO
-UNIFI_USERNAME=mcp_viewer
-UNIFI_PASSWORD_FILE=/opt/mcp-unifi/password
-UNIFI_VERIFY_SSL=false
-```
-
-`/opt/mcp-unifi/run.sh`:
-
-```bash
-#!/bin/bash
-set -a
-source /opt/mcp-unifi/unifi.env
-set +a
-exec /home/mcp/.local/bin/unifi-network-mcp
-```
-
-Permessi:
-
-```bash
-chmod 600 /opt/mcp-unifi/password /opt/mcp-unifi/unifi.env
-chmod 700 /opt/mcp-unifi/run.sh
-```
-
-Verifica che il UDM sia raggiungibile dal server MCP:
-
-```bash
-curl -k -I https://IP-UDM-PRO
-```
-
-> Il server non carica automaticamente i file `.env`: per questo le variabili vengono esportate da `run.sh`. `UNIFI_VERIFY_SSL=false` serve perché il UDM usa un certificato autofirmato.
-
----
-
-## 8. Registrare i server in Claude Code
-
-### 8.1 Test manuale (dal Fedora)
-
-Prima di registrarli, prova i server a mano:
-
-```bash
-ssh -T mcp@IP-SERVER-MCP /opt/mcp-wazuh/run.sh
-```
-
-Il comando resta in attesa senza stampare nulla. Incolla questa riga e premi Invio:
-
-```json
-{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}
-```
-
-Deve rispondere con un JSON contenente `serverInfo`. Esci con **Ctrl+C**. Ripeti lo stesso test con `/opt/mcp-unifi/run.sh`.
-
-### 8.2 Registrazione
-
-```bash
-claude mcp add --scope user wazuh -- ssh -o BatchMode=yes -o ConnectTimeout=10 -T mcp@IP-SERVER-MCP /opt/mcp-wazuh/run.sh
-
-claude mcp add --scope user unifi -- ssh -o BatchMode=yes -o ConnectTimeout=10 -T mcp@IP-SERVER-MCP /opt/mcp-unifi/run.sh
-
-claude mcp list
-```
-
-Le opzioni usate:
-
-- `--scope user`: il server è disponibile in tutti i progetti;
-- `BatchMode=yes`: SSH non fa domande, quindi fallisce subito invece di restare bloccato;
-- `ConnectTimeout=10`: errore rapido se il server non è raggiungibile;
-- `-T`: niente terminale, il canale stdio resta pulito.
-
-### 8.3 Verifica in Claude Code
-
-Avvia `claude` e digita `/mcp`: devi vedere `wazuh` e `unifi` connessi. Poi prova alcune richieste:
-
-- "Mostrami gli ultimi alert critici di Wazuh"
-- "Quali agenti Wazuh sono disconnessi?"
-- "Mostrami i client connessi sulla VLAN ospiti"
-- "Fai un audit delle regole firewall del UDM Pro"
-
----
-
-## 9. Risoluzione dei problemi
-
-### `npm error code EACCES` durante l'installazione di Claude Code
-
-npm cerca di scrivere in `/usr/local/lib`. Non usare `sudo npm`: usa l'installer nativo ([sezione 3](#3-client-fedora-installare-claude-code)). Per eliminare un'eventuale installazione npm precedente:
-
-```bash
-npm uninstall -g @anthropic-ai/claude-code
-npm config delete prefix
-rm -rf ~/.npm-global
-sed -i '/npm-global/d' ~/.bashrc
-```
-
-### `claude: File o directory non esistente` dopo il cambio di installazione
-
-Bash ricorda ancora il vecchio percorso. Svuota la cache dei comandi:
-
-```bash
-hash -r
-```
-
-In alternativa, apri un nuovo terminale.
-
-### `connection timed out after 30000ms`
-
-Di solito SSH è in attesa di un input che Claude Code non può dare, oppure il server MCP non parte.
-
-1. Esegui `ssh -o BatchMode=yes -T mcp@IP-SERVER-MCP echo ok` e interpreta il risultato:
-   - `Host key verification failed`: collegati una volta a mano e accetta la fingerprint;
-   - `Permission denied`: ripeti `ssh-copy-id`.
-2. Esegui il test manuale della [sezione 8.1](#81-test-manuale-dal-fedora). Gli errori più comuni sono:
-   - `Permission denied` / `No such file`: controlla percorsi e permessi (`ls -l /opt/mcp-*`);
-   - `Exec format error`: il binario è per un'architettura sbagliata;
-   - errori di connessione a Wazuh o UniFi: controlla host, porte, firewall e credenziali.
-3. Per maggiori dettagli avvia Claude Code con `claude --debug`, oppure allunga l'attesa con `MCP_TIMEOUT=60000 claude`.
-
----
-
-## 10. Rimozione
-
-### Dal client (Claude Code)
-
-```bash
-claude mcp list
-claude mcp remove wazuh --scope user
-claude mcp remove unifi --scope user
-```
-
-Senza `--scope`, se il nome esiste in più scope, Claude Code chiede quale rimuovere. Riavvia Claude Code se era aperto.
-
-### Dal server MCP (rimozione completa)
-
-```bash
-sudo rm -rf /opt/mcp-wazuh /opt/mcp-unifi
-sudo userdel -r mcp
-```
-
-Poi elimina anche gli account creati:
-
-- **Wazuh:** l'utente API `mcp_readonly`, l'utente dell'Indexer `mcp_indexer` e il ruolo `mcp_alerts_readonly`;
-- **UniFi:** l'amministratore locale `mcp_viewer`;
-- **Firewall della macchina Wazuh:** le regole per le porte 55000 e 9200.
-
----
-
-## 11. Sicurezza: più server MCP e più utenti
-
-Le sezioni 4–8 descrivono una configurazione **a utente singolo**: un solo account `mcp` possiede tutte le credenziali e chi ha la sua chiave SSH può usare tutti i server MCP e leggere tutte le credenziali. Con più persone e più server MCP servono separazione, privilegi minimi e tracciabilità.
-
-### 11.1 Modello di sicurezza
-
-```
-Claude Code (alice) ── ssh alice@server wazuh ──► sshd
-                                                  │  Match Group mcp-users:
-                                                  │  solo chiave, niente shell, niente forwarding
-                                                  ▼
-                                   /usr/local/bin/mcp-gateway   (ForceCommand)
-                                                  │  alice appartiene a mcp-wazuh-users?
-                                                  │  registra ALLOW/DENY nel journal
-                                                  ▼
-                        sudo -u mcp-wazuh /opt/mcp-wazuh/run.sh
-                                                  │  legge wazuh.env (visibile solo a mcp-wazuh)
-                                                  ▼
-                                      server MCP Wazuh (stdio)
-```
-
-| Livello | Protezione |
-|---|---|
-| Rete | SSH raggiungibile solo dalle reti dei client; porte dei backend aperte solo verso il server MCP |
-| SSH | Solo chiavi, niente root, niente password, tentativi limitati, fail2ban |
-| Utenti | Nessuna shell (`ForceCommand`), niente TTY né tunnel; chiavi in una cartella di root con scadenza opzionale |
-| Separazione tra server | Ogni server MCP gira con il **proprio** utente di servizio: chi usa (o compromette) un server MCP non può leggere le credenziali di un altro |
-| Autorizzazioni | Un gruppo per server MCP (`mcp-NOME-users`); una regola sudo consente di avviare **solo** il relativo `run.sh` |
-| Credenziali | File `600` di proprietà dell'utente di servizio: le persone non possono leggerle |
-| Backend | Account Wazuh e UniFi in sola lettura (sezioni 6 e 7) |
-| Tracciabilità | Ogni accesso, consentito o negato, finisce nel journal (`mcp-gateway`, `sudo`, `sshd`) |
-
-**Limite da conoscere.** Tutti gli utenti dello stesso server MCP usano lo stesso account sul backend (ad esempio `mcp_readonly` su Wazuh). Nei log di Wazuh o UniFi vedrai quindi sempre quell'account: per sapere *chi* ha fatto cosa, usa i log del gateway. Se ti servono permessi diversi per persona, crea istanze separate dello stesso server con account backend diversi, per esempio `wazuh` in sola lettura e `wazuh-admin` con più privilegi, ciascuna con il proprio gruppo.
-
-### 11.2 Hardening del sistema
-
-#### Aggiornamenti automatici di sicurezza
-
-RHEL / Rocky / Alma (su Fedora recenti il pacchetto è la variante dnf5, `dnf5-plugin-automatic`):
-
-```bash
-sudo dnf install dnf-automatic
-sudo sed -i 's/^apply_updates.*/apply_updates = yes/' /etc/dnf/automatic.conf
-sudo systemctl enable --now dnf-automatic.timer
-```
-
-Debian / Ubuntu:
-
-```bash
-sudo apt install unattended-upgrades
-sudo dpkg-reconfigure -plow unattended-upgrades
-```
-
-#### SSH: configurazione globale
-
-> ⚠️ **Prima di applicarla:** l'account amministratore deve già accedere con chiave SSH ed essere nel gruppo `ssh-admins`. Tieni **aperta una sessione** finché non hai verificato che una nuova connessione funziona.
-
-```bash
-sudo groupadd ssh-admins
-sudo usermod -aG ssh-admins TUO_UTENTE_ADMIN
-```
-
-`/etc/ssh/sshd_config.d/00-hardening.conf`:
-
-```
-PermitRootLogin no
-PasswordAuthentication no
-KbdInteractiveAuthentication no
-PubkeyAuthentication yes
-MaxAuthTries 3
-LoginGraceTime 30
-ClientAliveInterval 300
-ClientAliveCountMax 2
-AllowGroups ssh-admins mcp-users
-```
-
-```bash
-sudo sshd -t && sudo systemctl reload sshd     # su Debian/Ubuntu: reload ssh
-sudo sshd -T | grep -Ei 'permitrootlogin|passwordauthentication|allowgroups'
-```
-
-In sshd vale il **primo** valore letto: il prefisso `00-` fa sì che queste impostazioni prevalgano sugli altri file in `sshd_config.d`. Verificalo sempre con `sshd -T`.
-
-#### Firewall: SSH solo dalle reti dei client
-
-firewalld (esempio con rete client `192.168.10.0/24`):
-
-```bash
-sudo firewall-cmd --permanent --remove-service=ssh
-sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="192.168.10.0/24" service name="ssh" accept'
-sudo firewall-cmd --reload
-```
-
-ufw:
-
-```bash
-sudo ufw default deny incoming
-sudo ufw allow from 192.168.10.0/24 to any port 22 proto tcp
-sudo ufw enable
-```
-
-Per un livello in più, puoi limitare anche il traffico **in uscita**: il server MCP deve raggiungere solo Wazuh (55000, 9200), il UDM Pro (443), il DNS e i repository per gli aggiornamenti.
-
-#### fail2ban
-
-```bash
-sudo dnf install fail2ban        # oppure: sudo apt install fail2ban
-```
-
-`/etc/fail2ban/jail.d/sshd.local`:
-
-```ini
-[sshd]
-enabled  = true
-backend  = systemd
-maxretry = 5
-findtime = 10m
-bantime  = 1h
-```
-
-```bash
-sudo systemctl enable --now fail2ban
-sudo fail2ban-client status sshd
-```
-
-#### SELinux / AppArmor
-
-Lascia **SELinux in modalità enforcing** (Fedora/RHEL: `getenforce` deve rispondere `Enforcing`) oppure AppArmor attivo (Debian/Ubuntu). Se sshd non legge le chiavi in `/etc/ssh/mcp_keys`, ripristina i contesti con `sudo restorecon -Rv /etc/ssh/mcp_keys`, invece di disattivare SELinux.
-
-#### auditd: tracciare le modifiche ai file sensibili
-
-`/etc/audit/rules.d/mcp.rules`:
-
-```
--w /etc/ssh/mcp_keys/ -p wa -k mcp-keys
--w /etc/sudoers.d/ -p wa -k mcp-sudoers
--w /etc/ssh/sshd_config.d/ -p wa -k sshd-config
--w /usr/local/bin/mcp-gateway -p wa -k mcp-gateway
--w /opt/mcp-wazuh/ -p wa -k mcp-wazuh
--w /opt/mcp-unifi/ -p wa -k mcp-unifi
-```
-
-```bash
-sudo augenrules --load
-sudo ausearch -k mcp-keys -i        # esempio di consultazione
-```
-
-#### Monitorare il server MCP con Wazuh
-
-Visto che hai già Wazuh, **installa l'agente Wazuh sul server MCP**: accessi SSH, uso di sudo, ban di fail2ban, eventi di auditd e l'integrità dei file (FIM su `/opt/mcp-*`, `/etc/ssh`, `/etc/sudoers.d`) arriveranno così alla tua console.
-
-#### Altre buone pratiche
-
-- Disattiva i servizi che non servono: `systemctl list-units --type=service --state=running`.
-- Mantieni l'orario sincronizzato (chrony), essenziale per correlare i log.
-- Fai un backup **cifrato** di `/opt/mcp-*` e `/etc/ssh/mcp_keys`.
-- Ruota periodicamente le password degli account backend e le chiavi degli utenti (con `--expire`).
-
-### 11.3 Installazione di `mcp-admin`
-
-Lo script completo è nella [sezione 11.9](#119-lo-script-mcp-admin). Copialo sul server, poi:
-
-```bash
-sudo install -m 700 -o root -g root mcp-admin /usr/local/sbin/mcp-admin
-sudo mcp-admin setup
-```
-
-`setup` esegue queste operazioni:
-
-- crea il gruppo `mcp-users`;
-- crea `/etc/ssh/mcp_keys/`, dove stanno le chiavi autorizzate: appartengono a root e gli utenti non possono modificarle;
-- installa `/usr/local/bin/mcp-gateway`;
-- scrive `/etc/ssh/sshd_config.d/10-mcp-users.conf` con il blocco `Match Group mcp-users`, lo verifica con `sshd -t` (se non è valido annulla la modifica) e ricarica sshd.
-
-Per mostrare nelle istruzioni l'IP del server invece del nome host, avvia i comandi con `sudo MCP_SERVER_HOST=IP-SERVER-MCP mcp-admin ...`.
-
-### 11.4 Creare i server MCP (e migrare da utente singolo)
-
-```bash
-sudo mcp-admin server-add wazuh
-sudo mcp-admin server-add unifi
-```
-
-Per ogni server, `server-add` crea:
-
-- l'utente di servizio `mcp-NOME` (senza shell);
-- la cartella `/opt/mcp-NOME` con permessi `750`;
-- il gruppo `mcp-NOME-users`;
-- la regola `/etc/sudoers.d/mcp-NOME`, validata con `visudo`;
-- un `run.sh` di esempio, se non ne esiste già uno.
-
-Se la cartella esiste già, i file **non vengono sovrascritti**: ne viene solo cambiata la proprietà.
-
-#### Wazuh
-
-Se hai seguito la sezione 6, i file sono già in `/opt/mcp-wazuh`: `server-add wazuh` li assegna a `mcp-wazuh` e basta. Verifica:
-
-```bash
-sudo ls -l /opt/mcp-wazuh          # tutto di mcp-wazuh; wazuh.env con permessi 600
-sudo -u mcp-wazuh /opt/mcp-wazuh/run.sh
-```
-
-Incolla la riga JSON di `initialize` (sezione 8.1): deve rispondere con `serverInfo`.
-
-#### UniFi
-
-Il pacchetto era installato nella home del vecchio utente `mcp`. Va reinstallato **dentro** `/opt/mcp-unifi`, così l'utente di servizio è autosufficiente:
-
-```bash
-# uv di sistema (una volta)
-curl -LsSf https://astral.sh/uv/install.sh | sudo env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh
-
-# Python e pacchetto dentro /opt/mcp-unifi, come utente di servizio
-sudo -u mcp-unifi env HOME=/opt/mcp-unifi UV_PYTHON_INSTALL_DIR=/opt/mcp-unifi/python UV_CACHE_DIR=/opt/mcp-unifi/.cache \
-  /usr/local/bin/uv venv --python 3.13 /opt/mcp-unifi/venv
-sudo -u mcp-unifi env HOME=/opt/mcp-unifi UV_CACHE_DIR=/opt/mcp-unifi/.cache \
-  /usr/local/bin/uv pip install --python /opt/mcp-unifi/venv/bin/python unifi-network-mcp
-```
-
-Nel file `/opt/mcp-unifi/run.sh`, l'ultima riga diventa:
-
-```bash
-exec /opt/mcp-unifi/venv/bin/unifi-network-mcp
-```
-
-Per gli aggiornamenti futuri, ripeti il secondo comando `uv pip install` aggiungendo `--upgrade`.
-
-Se `unifi.env` e `password` erano già in `/opt/mcp-unifi`, rilancia `sudo mcp-admin server-add unifi` per riallinearne la proprietà. Poi prova con `sudo -u mcp-unifi /opt/mcp-unifi/run.sh`.
-
-#### Eliminare il vecchio utente singolo
-
-Quando i nuovi accessi funzionano:
-
-```bash
-sudo userdel -r mcp
-```
-
-Sui client, rimuovi le vecchie registrazioni (`claude mcp remove wazuh --scope user` e simili) e registra quelle nuove (sezione 11.6).
-
-#### Aggiungere altri server MCP in futuro
-
-```bash
-sudo mcp-admin server-add NOME
-```
-
-Poi metti credenziali e binari in `/opt/mcp-NOME` (proprietà `mcp-NOME`, file segreti in `600`), completa `run.sh` e autorizza gli utenti con `user-grant`.
-
-### 11.5 Gestione degli utenti
-
-**Metodo consigliato: chiave generata dall'utente.** La chiave privata non lascia mai il suo PC. L'utente esegue sul proprio client `ssh-keygen -t ed25519 -f ~/.ssh/mcp_alice` e ti invia il file `.pub`:
-
-```bash
-sudo mcp-admin user-add alice --servers wazuh,unifi --pubkey /tmp/alice.pub --expire 20271231
-```
-
-**Alternativa: chiave generata sul server e mostrata a terminale.**
-
-```bash
-sudo mcp-admin user-add bob --servers wazuh
-```
-
-Lo script:
-
-1. genera una chiave ed25519 in memoria (`/dev/shm`);
-2. autorizza la chiave pubblica;
-3. **stampa la chiave privata una sola volta** insieme ai comandi `claude mcp add` già pronti;
-4. distrugge la chiave privata con `shred`.
-
-Accortezze:
-
-- trasmetti la chiave su un canale sicuro, non via email o chat in chiaro;
-- ricorda che resta nello scrollback del terminale: chiudilo, oppure esegui `clear && printf '\033[3J'`;
-- attenzione ai log di tmux o screen, se li usi.
-
-La chiave non ha passphrase perché Claude Code usa SSH in modalità non interattiva. Se l'utente ne aggiunge una (`ssh-keygen -p -f ~/.ssh/mcp_bob`), dovrà caricarla in `ssh-agent` prima di avviare Claude Code.
-
-Altri comandi:
-
-```bash
-sudo mcp-admin user-grant bob unifi          # aggiunge un server
-sudo mcp-admin user-revoke bob unifi         # toglie un server e chiude le sue sessioni
-sudo mcp-admin user-rotate-key bob           # nuova chiave (anche --pubkey / --expire)
-sudo mcp-admin user-lock bob                 # sospende subito l'accesso
-sudo mcp-admin user-unlock bob               # lo riattiva
-sudo mcp-admin user-del bob                  # elimina l'utente e la sua chiave
-sudo mcp-admin list                          # panoramica
-```
-
-Esempio di `list`:
-
-```
-SERVER MCP
-  NOME                 RUN.SH    UTENTI AUTORIZZATI
-  unifi                ok        alice
-  wazuh                ok        alice,bob
-
-UTENTI MCP
-  UTENTE               CHIAVE      SCADENZA   SERVER
-  alice                attiva      20271231   wazuh,unifi
-  bob                  sospesa     -          wazuh
-```
-
-Le autorizzazioni aggiunte valgono dalla connessione successiva. `user-revoke`, `user-rotate-key`, `user-lock` e `user-del` chiudono subito **tutte** le sessioni attive dell'utente.
-
-### 11.6 Lato client (per ogni utente)
-
-1. Salva la chiave privata, per esempio in `~/.ssh/mcp_alice`, e proteggila con `chmod 600 ~/.ssh/mcp_alice`.
-2. Aggiungi un alias in `~/.ssh/config`, così i comandi restano corti:
-
-   ```
-   Host mcp
-       HostName IP-SERVER-MCP
-       User alice
-       IdentityFile ~/.ssh/mcp_alice
-       IdentitiesOnly yes
-       BatchMode yes
-       ConnectTimeout 10
-   ```
-
-3. Esegui il primo collegamento, per accettare la fingerprint del server:
-
-   ```bash
-   ssh -o BatchMode=no -T mcp wazuh
-   ```
-
-   Se il comando resta in attesa senza errori, funziona: esci con Ctrl+C.
-
-4. Registra i server in Claude Code:
-
-   ```bash
-   claude mcp add --scope user wazuh -- ssh -T mcp wazuh
-   claude mcp add --scope user unifi -- ssh -T mcp unifi
-   ```
-
-L'ultimo argomento (`wazuh`, `unifi`) è il **nome del server MCP** richiesto al gateway: l'utente non indica mai percorsi o comandi.
-
-### 11.7 Verifiche di sicurezza
-
-Dal client di un utente, questi tentativi **devono fallire**:
-
-```bash
-ssh mcp                                  # "Accesso interattivo non consentito"
-ssh mcp 'wazuh; id'                      # "Nome del server MCP non valido"
-ssh mcp unifi                            # se non autorizzato: "Non sei autorizzato..."
-ssh -N -L 8080:127.0.0.1:22 mcp          # il port forwarding viene rifiutato
-```
-
-Sul server:
-
-```bash
-# un utente non può leggere le credenziali
-sudo -u alice cat /opt/mcp-wazuh/wazuh.env                # Permission denied
-
-# un utente non può avviare comandi diversi da run.sh
-sudo -u alice sudo -n -u mcp-wazuh /bin/bash              # rifiutato da sudo
-
-# configurazione sshd effettiva per un utente MCP
-sudo sshd -T -C user=alice,host=client,addr=192.168.10.20 \
-  | grep -Ei 'forcecommand|disableforwarding|permittty|authorizedkeysfile'
-```
-
-### 11.8 Registri e audit
-
-```bash
-journalctl -t mcp-gateway --since today          # chi ha usato quale server MCP, e i tentativi negati
-journalctl _COMM=sudo --since today              # esecuzioni di run.sh
-journalctl -u sshd --since today                 # accessi SSH (su Debian/Ubuntu: -u ssh)
-sudo ausearch -k mcp-keys -i                     # modifiche alle chiavi autorizzate
-```
-
-Esempio di voci del gateway:
-
-```
-mcp-gateway: ALLOW user=alice from=192.168.10.20 server=wazuh
-mcp-gateway: DENY user=bob from=192.168.10.31 server=unifi reason=not-authorized
-```
-
-### 11.9 Lo script `mcp-admin`
-
-Salvalo come `mcp-admin` e installalo come indicato nella [sezione 11.3](#113-installazione-di-mcp-admin). Questa versione non modifica proprietà e `run.sh` dei server gestiti dalla pipeline (sezione 12), riconoscibili dal file `.mcp-managed.json`.
+`server/mcp-admin` — installato in `/usr/local/sbin/mcp-admin`. Il gateway `/usr/local/bin/mcp-gateway` è generato da `mcp-admin setup`
 
 ```bash
 #!/usr/bin/env bash
@@ -1317,308 +1715,9 @@ main() {
 main "$@"
 ```
 
----
+### A.2 mcp-reconcile
 
-## 12. Automazione con GitHub Actions (GitOps)
-
-In questa sezione la gestione di server MCP e utenti passa da comandi manuali a **file YAML versionati su GitHub**. Ogni modifica segue lo stesso percorso: pull request, piano automatico, revisione, approvazione e applicazione. Le credenziali usate dai server MCP (API key, username, password) restano nei **secret di GitHub** e arrivano sul server solo dopo l'approvazione.
-
-### 12.1 Come funziona
-
-```
- PR su config/ o keys/                          merge su main
-        │                                              │
-        ▼                                              ▼
- ┌──────────────────────┐                   ┌──────────────────────┐
- │ mcp-plan.yml         │                   │ mcp-deploy.yml       │
- │ validazione YAML     │                   │ job "plan"           │
- │ piano (sola lettura) │                   │ piano nel riepilogo  │
- └──────────┬───────────┘                   └──────────┬───────────┘
-            │ revisione CODEOWNERS                     │
-            ▼                                          ▼
-        merge ───────────────────────────►  ⏸  APPROVAZIONE (environment mcp-production)
-                                                       │  solo ora il job riceve
-                                                       │  chiave "apply" e credenziali
-                                                       ▼
-                                            ┌──────────────────────┐
-                                            │ job "apply"          │
-                                            │ ssh mcp-deploy@...   │──► mcp-reconcile apply
-                                            └──────────────────────┘        │
-                                                                            ▼
-                                                                   mcp-admin (utenti, chiavi,
-                                                                   sudo) + installazione e
-                                                                   configurazione dei server
-```
-
-Principi:
-
-- **Dichiarativo.** I file YAML descrivono lo stato voluto. `mcp-reconcile` confronta questo stato con il server ed esegue solo le differenze. Se un utente sparisce dal file, viene eliminato (deprovisioning).
-- **Due chiavi SSH distinte.** La chiave *plan* può eseguire solo `mcp-reconcile plan`, che non modifica nulla. La chiave *apply* può eseguire solo `mcp-reconcile apply` e sta esclusivamente nell'environment protetto. Il vincolo è imposto dal server, con `command=` e `from=` nelle chiavi autorizzate, e non dalla pipeline.
-- **Segreti dopo l'approvazione.** Il job che riceve i secret dell'environment si ferma finché non viene approvato. I valori non compaiono mai nel repository, nel piano o nei log.
-- **Freni di sicurezza.** L'apply si blocca se eliminerebbe più utenti di `policy.max_user_deletions`. I binari scaricati devono corrispondere allo sha256 dichiarato. I pacchetti pip devono avere una versione fissa.
-- **Drift.** Il piano notturno segnala le modifiche fatte a mano sul server. Il successivo apply le riallinea al file.
-
-> Quando la pipeline è attiva, **non gestire utenti e server a mano** con `mcp-admin`: il deploy successivo riporterebbe tutto a quanto scritto nei file YAML. `mcp-admin` resta utile per consultare (`list`) e per le emergenze (sezione 12.8).
-
-### 12.2 Requisiti e limiti
-
-**Step di approvazione e piano GitHub.** L'approvazione nativa usa i *required reviewers* degli environment. Con i piani GitHub Free, Pro e Team, i revisori obbligatori sono disponibili solo per i repository pubblici. Per un repository **privato** (quello giusto per questo uso) serve **GitHub Enterprise**. Environment, secret di environment e restrizioni sui branch sono invece disponibili anche nei repository privati con Pro, Team ed Enterprise.
-
-Se sei su Team o Pro con un repository privato:
-
-- il job `apply` non si fermerà ad aspettare, ma riceverà comunque i secret solo da `main`, grazie alle *deployment branches*;
-- l'approvazione diventa la **revisione obbligatoria della pull request** da parte dei CODEOWNERS, imposta dalle regole del branch `main` (disponibili sui piani a pagamento);
-- per aggiungere un secondo passaggio manuale, togli il trigger `push` da `mcp-deploy.yml` e lascia solo `workflow_dispatch`: il deploy partirà solo quando una persona autorizzata preme **Run workflow**, dopo aver letto il piano della PR.
-
-**Runner self-hosted.** Il server MCP è nella rete interna, quindi i runner ospitati da GitHub non lo raggiungono. Serve un runner nella tua rete (sezione 12.5).
-
-**Accesso a Internet dal server MCP.** Per le installazioni servono GitHub (release dei binari e build di Python usate da `uv`) e PyPI. Se il server non ha accesso in uscita, usa `install.method: none` e installa a mano.
-
-**Solo chiavi pubbliche.** Nella pipeline gli utenti forniscono sempre la propria chiave pubblica. La modalità "chiave generata dal server" di `mcp-admin` non è usata, perché la chiave privata finirebbe nei log.
-
-### 12.3 Struttura del repository
-
-```
-mcp-infra/
-├── .github/
-│   ├── CODEOWNERS
-│   └── workflows/
-│       ├── mcp-plan.yml        # PR, notturno, manuale: validazione + piano
-│       └── mcp-deploy.yml      # main: piano → approvazione → apply
-├── config/
-│   ├── servers.yaml            # server MCP, installazione, variabili, riferimenti ai secret
-│   └── users.yaml              # utenti, server autorizzati, scadenze, sospensioni
-├── keys/
-│   ├── alice.pub               # una chiave pubblica per utente
-│   └── bob.pub
-├── scripts/
-│   ├── build_state.py          # YAML → JSON (con o senza segreti)
-│   └── ssh_run.sh              # invia lo stato al server via SSH
-└── server/                     # da installare sul server MCP
-    ├── mcp-admin
-    ├── mcp-reconcile
-    └── install-deploy.sh
-```
-
-Il repository modello completo è allegato come archivio. Il codice di tutti i file è anche nella [sezione 12.11](#1211-codice).
-
-### 12.4 Preparazione del server MCP
-
-**1. Prerequisiti.** Servono `python3`, `sudo` e, per i server con `install.method: pip`, `uv` in `/usr/local/bin`:
-
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sudo env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh
-```
-
-**2. Genera le due chiavi della pipeline** su una postazione di amministrazione, non sul runner:
-
-```bash
-ssh-keygen -t ed25519 -N "" -C "mcp-plan"  -f mcp_plan
-ssh-keygen -t ed25519 -N "" -C "mcp-apply" -f mcp_apply
-```
-
-**3. Installa** sul server MCP, copiando la cartella `server/` del repository e le due chiavi **pubbliche**:
-
-```bash
-cd server
-sudo ./install-deploy.sh --plan-key ../mcp_plan.pub --apply-key ../mcp_apply.pub --from IP-RUNNER
-```
-
-Lo script esegue queste operazioni:
-
-- installa `mcp-admin` e `mcp-reconcile` (ed esegue `mcp-admin setup` se non è mai stato fatto);
-- crea l'utente `mcp-deploy`;
-- scrive la regola sudo, che consente **solo** `mcp-reconcile plan` e `mcp-reconcile apply`;
-- scrive le chiavi autorizzate in `/etc/ssh/mcp_deploy_keys`:
-
-  ```
-  restrict,from="IP-RUNNER",command="/usr/bin/sudo -n /usr/local/sbin/mcp-reconcile plan"  ssh-ed25519 ... mcp-plan
-  restrict,from="IP-RUNNER",command="/usr/bin/sudo -n /usr/local/sbin/mcp-reconcile apply" ssh-ed25519 ... mcp-apply
-  ```
-
-- aggiunge il blocco sshd `Match User mcp-deploy`.
-
-**4. Hardening.** Se usi `AllowGroups` (sezione 11.2), aggiungi `mcp-deploy`:
-
-```
-AllowGroups ssh-admins mcp-users mcp-deploy
-```
-
-Nel firewall del server MCP, consenti SSH anche dall'IP del runner.
-
-**5. Verifica dal runner.** Uno stato vuoto deve produrre un errore di validazione: vuol dire che SSH, sudo e reconcile rispondono.
-
-```bash
-echo '{}' | ssh -i mcp_plan -T mcp-deploy@IP-SERVER-MCP
-# ### ❌ Stato non valido
-# versione dello stato non supportata
-```
-
-**6. Server già configurati a mano** (sezioni 6, 7 e 11). Dichiarali in `servers.yaml` con lo stesso nome. Al primo apply compare `presa in gestione`: `run.sh`, il file `.env` e i file dei segreti vengono rigenerati dal YAML, e il codice viene reinstallato secondo `install`. I vecchi file che non corrispondono più a nulla (es. `/opt/mcp-unifi/.cache`) si possono cancellare a mano.
-
-### 12.5 Runner self-hosted
-
-- Usa una **VM dedicata**: non il server MCP, non una postazione personale. Il runner riceve la chiave apply e le credenziali, quindi va protetto come il server MCP (hardening della sezione 11.2, aggiornamenti, agente Wazuh).
-- Idealmente **due runner**: uno con etichetta `mcp-plan` e uno con etichetta `mcp-apply`, quest'ultimo usato solo dal job di deploy. Con un solo runner assegnagli entrambe le etichette.
-- Pacchetti necessari: `git`, `python3`, `python3-venv` (Debian/Ubuntu), `openssh-client`.
-- Registrazione da **Settings → Actions → Runners → New self-hosted runner**. Segui i comandi mostrati, indicando le etichette ed eseguendolo come servizio con un utente non privilegiato:
-
-  ```bash
-  ./config.sh --url https://github.com/TUA-ORG/mcp-infra --token <TOKEN> \
-              --labels mcp-apply --name mcp-runner-apply --unattended
-  sudo ./svc.sh install runner      # "runner" = utente locale senza privilegi
-  sudo ./svc.sh start
-  ```
-
-- Valuta i runner **effimeri** (`--ephemeral`): eseguono un solo job e poi si deregistrano. Vanno però ricreati automaticamente.
-- Usa il runner solo con questo **repository privato**. I workflow sono configurati per non girare sulle PR provenienti da fork.
-
-### 12.6 Configurazione del repository GitHub
-
-**Environment `mcp-production`** (Settings → Environments → New environment):
-
-- **Required reviewers**: le persone o il team che approvano. Attiva *Prevent self-review*. Su Team/Pro con repository privato vedi la sezione 12.2.
-- **Deployment branches and tags**: *Selected branches* → solo `main`.
-
-**Secret e variabili:**
-
-| Nome | Tipo | Dove | Contenuto |
-|---|---|---|---|
-| `MCP_PLAN_SSH_KEY` | secret | repository | chiave privata `mcp_plan` (può solo leggere) |
-| `MCP_APPLY_SSH_KEY` | secret | environment `mcp-production` | chiave privata `mcp_apply` |
-| `WAZUH_API_USERNAME`, `WAZUH_API_PASSWORD` | secret | environment `mcp-production` | utente API Wazuh in sola lettura |
-| `WAZUH_INDEXER_USERNAME`, `WAZUH_INDEXER_PASSWORD` | secret | environment `mcp-production` | utente dell'Indexer in sola lettura |
-| `UNIFI_USERNAME`, `UNIFI_PASSWORD` | secret | environment `mcp-production` | amministratore locale UniFi *View Only* |
-| `MCP_SERVER_HOST` | variabile | repository | IP o nome del server MCP |
-| `MCP_SSH_KNOWN_HOSTS` | variabile | repository | riga known_hosts del server (stampata da `install-deploy.sh`) |
-
-Con la CLI `gh`, dalla cartella con le chiavi:
-
-```bash
-gh secret set MCP_PLAN_SSH_KEY < mcp_plan
-gh secret set MCP_APPLY_SSH_KEY --env mcp-production < mcp_apply
-gh secret set WAZUH_API_USERNAME --env mcp-production        # chiede il valore senza mostrarlo
-gh secret set WAZUH_API_PASSWORD --env mcp-production
-gh secret set WAZUH_INDEXER_USERNAME --env mcp-production
-gh secret set WAZUH_INDEXER_PASSWORD --env mcp-production
-gh secret set UNIFI_USERNAME --env mcp-production
-gh secret set UNIFI_PASSWORD --env mcp-production
-
-gh variable set MCP_SERVER_HOST --body "IP-SERVER-MCP"
-gh variable set MCP_SSH_KNOWN_HOSTS --body "IP-SERVER-MCP ssh-ed25519 AAAA..."
-
-shred -u mcp_plan mcp_apply       # le chiavi private ora esistono solo su GitHub
-```
-
-Verifica la fingerprint prima di salvarla: dal runner esegui `ssh-keyscan -t ed25519 IP-SERVER-MCP`, poi confronta con `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` eseguito **sul server**. Il nome nella riga known_hosts deve coincidere con `MCP_SERVER_HOST`.
-
-**Regole del branch `main`** (Settings → Rules → Rulesets, oppure Branch protection):
-
-- pull request obbligatoria, con almeno 1 approvazione e **revisione dei Code Owners** (file `.github/CODEOWNERS`);
-- *Dismiss stale approvals* quando arrivano nuovi commit;
-- status check obbligatorio: `plan` (del workflow `MCP · validazione e piano`);
-- niente force push né cancellazione, e le regole valgono anche per gli amministratori.
-
-**Impostazioni di Actions** (Settings → Actions → General):
-
-- *Workflow permissions*: **Read repository contents**;
-- consenti solo azioni di GitHub e verificate;
-- per le PR da fork, richiedi l'approvazione prima di eseguire i workflow.
-
-Per un livello in più, fissa `actions/checkout` a uno SHA di commit invece del tag `@v4`.
-
-### 12.7 I file di configurazione
-
-**`config/servers.yaml`**: ogni server MCP ha questi campi.
-
-| Campo | Significato |
-|---|---|
-| `state` | `present` (predefinito) o `absent` per dismetterlo: rimuove utente di servizio, gruppo e regola sudo, ma conserva la cartella |
-| `install.method: binary` | scarica `url` (solo https), verifica `sha256` (obbligatorio) e installa in `{dir}/bin/<name>` |
-| `install.method: pip` | crea `{dir}/venv` con Python `python` tramite `uv` e installa `package` (versione obbligatoria, `nome==x.y.z`) |
-| `install.method: none` | nessuna installazione automatica |
-| `command` | comando del server MCP; `{dir}` diventa `/opt/mcp-NOME` |
-| `env` | variabili del file `/opt/mcp-NOME/NOME.env`; `{ secret: NOME }` prende il valore dal secret GitHub |
-| `files` | file creati in `{dir}` (es. il file password di UniFi), con valore letterale o `{ secret: NOME }` |
-
-Permessi sul server: il codice (`bin/`, `venv/`, `python/`) e `run.sh` sono di **root** e leggibili dall'utente di servizio, che quindi non può modificare il proprio codice. I file `.env` e dei segreti sono `640 root:mcp-NOME`.
-
-**`config/users.yaml`**:
-
-| Campo | Significato |
-|---|---|
-| `servers` | server MCP autorizzati (almeno uno) |
-| `expire` | facoltativo, `AAAA-MM-GG`: dopo questa data la chiave smette di funzionare |
-| `enabled` | `false` sospende l'utente senza eliminarlo |
-| `key_file` | facoltativo, predefinito `keys/NOME.pub` |
-
-Il file `keys/NOME.pub` contiene una sola riga: la chiave pubblica senza opzioni davanti.
-
-### 12.8 Operazioni quotidiane
-
-Ogni operazione è una pull request. Il piano compare nel riepilogo del job.
-
-| Operazione | Cosa cambiare |
-|---|---|
-| Nuovo utente | aggiungi `keys/NOME.pub` e la voce in `users.yaml` |
-| Dare o togliere un server | modifica `servers:` dell'utente |
-| Sospendere | `enabled: false` |
-| Deprovisioning | rimuovi la voce da `users.yaml` e il file `.pub` |
-| Nuova chiave (PC cambiato o perso) | sostituisci `keys/NOME.pub` |
-| Scadenza | aggiungi o modifica `expire` |
-| Nuovo server MCP | aggiungi il blocco in `servers.yaml` e i relativi secret nell'environment, poi autorizza gli utenti |
-| Aggiornare un server MCP | cambia `url` e `sha256`, oppure la versione in `package` |
-| Ruotare una credenziale | aggiorna il secret su GitHub, poi **Actions → MCP · deploy → Run workflow** (nessuna PR necessaria) |
-| Dismettere un server | `state: absent`, dopo averlo tolto a tutti gli utenti |
-| Eliminare molti utenti insieme | alza temporaneamente `policy.max_user_deletions` nella stessa PR |
-
-**Emergenze** (chiave compromessa, dipendente uscito all'improvviso). Blocca subito dal server:
-
-```bash
-sudo mcp-admin user-lock NOME
-```
-
-Poi apri **subito** la PR (`enabled: false` o rimozione dell'utente). Altrimenti il deploy successivo, oppure un apply manuale, riattiverebbe l'utente.
-
-### 12.9 Cosa vede chi approva
-
-Il riepilogo del job `plan` mostra le modifiche prima dell'approvazione:
-
-```
-### Piano MCP — 5 modifiche
-
-- 🟡 server `wazuh`: installazione binario mcp-server-wazuh (sha256 3f9a1c0b2e4d…)
-- 🟡 utente `alice`: scadenza 20280630
-- 🟢 utente `carla`: creazione con accesso a unifi
-- 🟡 utente `bob`: sospeso
-- 🔴 utente `dario`: eliminato
-
-> I valori segreti non sono disponibili in fase di piano: vengono confrontati durante l'apply.
-```
-
-Il job `apply` riporta l'esito di ogni operazione, segnalando per nome, e mai per valore, le variabili segrete cambiate. Al primo errore l'applicazione si interrompe e le operazioni successive non vengono eseguite.
-
-### 12.10 Riepilogo della sicurezza della pipeline
-
-| Rischio | Contromisura |
-|---|---|
-| Modifica non autorizzata della configurazione | PR obbligatoria, revisione CODEOWNERS, approvazione dell'environment |
-| PR che modifica il workflow per fare apply | la chiave apply esiste solo nell'environment, limitato a `main`; la chiave plan può solo leggere, per vincolo del server |
-| Furto della chiave della pipeline | `from=` limita l'uso all'IP del runner; `command=` limita il comando; nessuna shell, nessun forwarding |
-| Esposizione dei segreti | secret GitHub, disponibili solo dopo l'approvazione e mascherati nei log; inviati via stdin SSH, mai su disco sul runner né nella riga di comando; sul server in file `640` |
-| Binari manomessi | sha256 obbligatorio e versioni pip fissate |
-| Errore di massa | `max_user_deletions` |
-| Man-in-the-middle SSH | `StrictHostKeyChecking=yes` con fingerprint verificata in `MCP_SSH_KNOWN_HOSTS` |
-| Esecuzioni concorrenti | `concurrency` nel workflow e lock sul server |
-| Tracciabilità | cronologia Git e approvazioni su GitHub; `journalctl -t mcp-reconcile`, `-t mcp-gateway` e auditd sul server |
-
-Una nota sul passaggio dei secret: il workflow passa allo script tutti i secret disponibili (`toJSON(secrets)`), perché i nomi da usare sono definiti nei file YAML. Lo script usa solo quelli richiesti e non li stampa mai. Tieni comunque nell'environment `mcp-production` solo i secret di questa pipeline.
-
-### 12.11 Codice
-
-#### 12.11.1 mcp-reconcile (server)
-
-`server/mcp-reconcile`
+`server/mcp-reconcile` — installato in `/usr/local/sbin/mcp-reconcile`
 
 ```python
 #!/usr/bin/env python3
@@ -2200,7 +2299,7 @@ if __name__ == "__main__":
     sys.exit(main())
 ```
 
-#### 12.11.2 install-deploy.sh (server)
+### A.3 install-deploy.sh
 
 `server/install-deploy.sh`
 
@@ -2344,7 +2443,7 @@ else
 fi
 ```
 
-#### 12.11.3 build_state.py (pipeline)
+### A.4 build_state.py
 
 `scripts/build_state.py`
 
@@ -2603,7 +2702,7 @@ if __name__ == "__main__":
     main()
 ```
 
-#### 12.11.4 ssh_run.sh (pipeline)
+### A.5 ssh_run.sh
 
 `scripts/ssh_run.sh`
 
@@ -2649,7 +2748,7 @@ if [[ ${rc[0]} -ne 0 ]]; then echo "::error::configurazione non valida (vedi sop
 if [[ ${rc[1]} -ne 0 ]]; then echo "::error::mcp-reconcile ${mode} non riuscito (codice ${rc[1]})"; exit 1; fi
 ```
 
-#### 12.11.5 Workflow di piano
+### A.6 Workflow di validazione e piano
 
 `.github/workflows/mcp-plan.yml`
 
@@ -2701,7 +2800,7 @@ jobs:
         run: bash scripts/ssh_run.sh plan
 ```
 
-#### 12.11.6 Workflow di deploy
+### A.7 Workflow di deploy
 
 `.github/workflows/mcp-deploy.yml`
 
@@ -2779,100 +2878,7 @@ jobs:
         run: bash scripts/ssh_run.sh apply
 ```
 
-#### 12.11.7 File di configurazione di esempio: servers.yaml
-
-`config/servers.yaml`
-
-```yaml
-# =============================================================================
-# Server MCP gestiti dalla pipeline
-#
-# - I valori { secret: NOME } vengono letti dai secret dell'environment GitHub
-#   "mcp-production" e non compaiono mai nel repository né nei log.
-# - {dir} viene sostituito con la cartella del server (/opt/mcp-NOME).
-# - Per dismettere un server non cancellarlo: imposta  state: absent
-# =============================================================================
-
-policy:
-  # blocca l'apply se in un colpo solo verrebbero eliminati più utenti di così
-  max_user_deletions: 3
-
-servers:
-
-  wazuh:
-    install:
-      method: binary
-      # scegli la release da https://github.com/gbrigandi/mcp-server-wazuh/releases
-      url: https://github.com/gbrigandi/mcp-server-wazuh/releases/download/<VERSIONE>/mcp-server-wazuh-linux-amd64
-      # calcolalo con:  curl -sL <url> | sha256sum
-      sha256: "<SHA256>"
-      name: mcp-server-wazuh
-    command: ["{dir}/bin/mcp-server-wazuh", "--transport", "stdio"]
-    env:
-      WAZUH_API_HOST: 192.168.10.50
-      WAZUH_API_PORT: 55000
-      WAZUH_API_USERNAME: { secret: WAZUH_API_USERNAME }
-      WAZUH_API_PASSWORD: { secret: WAZUH_API_PASSWORD }
-      WAZUH_INDEXER_HOST: 192.168.10.50
-      WAZUH_INDEXER_PORT: 9200
-      WAZUH_INDEXER_USERNAME: { secret: WAZUH_INDEXER_USERNAME }
-      WAZUH_INDEXER_PASSWORD: { secret: WAZUH_INDEXER_PASSWORD }
-      WAZUH_VERIFY_SSL: false
-      RUST_LOG: warn
-
-  unifi:
-    install:
-      method: pip
-      # versione fissa: controlla l'ultima su https://pypi.org/project/unifi-network-mcp/
-      package: unifi-network-mcp==<VERSIONE>
-      python: "3.13"
-    command: ["{dir}/venv/bin/unifi-network-mcp"]
-    env:
-      UNIFI_HOST: 192.168.10.1
-      UNIFI_USERNAME: { secret: UNIFI_USERNAME }
-      UNIFI_PASSWORD_FILE: "{dir}/password"
-      UNIFI_VERIFY_SSL: false
-    files:
-      # file 640 root:mcp-unifi con il contenuto del secret
-      password: { secret: UNIFI_PASSWORD }
-
-  # Esempio di server dismesso:
-  # vecchio-server:
-  #   state: absent
-```
-
-#### 12.11.8 File di configurazione di esempio: users.yaml
-
-`config/users.yaml`
-
-```yaml
-# =============================================================================
-# Utenti MCP gestiti dalla pipeline
-#
-# - Aggiungere un utente:  metti la sua chiave pubblica in keys/NOME.pub
-#                          e aggiungi una voce qui sotto.
-# - Togliere un server:    rimuovilo dalla lista "servers".
-# - Sospendere:            enabled: false   (la chiave resta, l'accesso no)
-# - Deprovisioning:        cancella la voce (e il file .pub): l'utente viene eliminato.
-# - La chiave privata resta sempre sul PC dell'utente: qui solo chiavi pubbliche.
-# =============================================================================
-
-users:
-
-  alice:
-    servers: [wazuh, unifi]
-    expire: 2027-12-31          # facoltativo: dopo questa data la chiave non vale più
-
-  bob:
-    servers: [wazuh]
-
-  # carla:
-  #   servers: [unifi]
-  #   enabled: false
-  #   key_file: keys/carla-laptop.pub   # facoltativo, predefinito keys/NOME.pub
-```
-
-#### 12.11.9 CODEOWNERS
+### A.8 CODEOWNERS
 
 `.github/CODEOWNERS`
 
@@ -2886,14 +2892,59 @@ users:
 /.github/    @TUA-ORG/sicurezza
 ```
 
-La versione aggiornata di `mcp-admin`, compatibile con i server gestiti dalla pipeline, è nella [sezione 11.9](#119-lo-script-mcp-admin).
+---
+
+## Appendice B — Evoluzione: segreti in HashiCorp Vault
+
+> Questa appendice descrive un'evoluzione **non ancora implementata** negli script dell'Appendice A.
+
+Oggi le credenziali dei sistemi stanno nei secret dell'environment GitHub `mcp-production`. Per centralizzarle in un gestore di segreti interno puoi usare **Vault Community** oppure **OpenBao**, il fork open source della Linux Foundation: le API sono compatibili. HCP Vault Secrets, la versione SaaS semplificata, è stata dismessa nel 2026. Il gestore va installato nella rete interna, su una macchina dedicata, con TLS, audit attivo e backup.
+
+### Organizzazione dei segreti
+
+Si usa un motore KV v2 (`mcp/`) con un percorso per ogni server MCP. KV v2 conserva lo storico delle versioni.
+
+```
+mcp/
+├── wazuh     → api_username, api_password, indexer_username, indexer_password
+├── unifi     → username, password
+└── proxmox   → user, token_name, token_value
+```
+
+```bash
+vault secrets enable -path=mcp kv-v2
+vault kv put mcp/proxmox user=mcp@pve token_name=mcp token_value=-     # il valore viene letto da stdin
+vault kv get mcp/proxmox
+vault kv rollback -version=2 mcp/proxmox
+```
+
+Servono due policy: `mcp-admin` per le persone che gestiscono i segreti (`create`, `update`, `read` su `mcp/data/*`) e `mcp-deploy` per la pipeline (solo `read` su `mcp/data/*`).
+
+### Integrazione possibile
+
+Nei YAML, i riferimenti diventerebbero `{ vault: "percorso#campo" }`, per esempio `PROXMOX_TOKEN_VALUE: { vault: "proxmox#token_value" }`. Esistono due modelli di integrazione:
+
+| | A — Vault letto dalla pipeline | B — Vault letto dal server MCP a ogni avvio |
+|---|---|---|
+| Come | il job `apply` si autentica a Vault con il token OIDC di GitHub, vincolato a repository, environment e `main` | ogni server MCP ha un'identità AppRole che può leggere solo il proprio percorso; `run.sh` legge le credenziali all'avvio |
+| Credenziali su GitHub | nessuna | nessuna |
+| Credenziali su disco nel server MCP | sì (`640`) | no |
+| Rotazione | Vault + deploy | solo Vault |
+| Se Vault non risponde | niente deploy | i server MCP non partono |
+| Modifiche | `build_state.py` e workflow | `mcp-reconcile`, `run.sh`, distribuzione delle identità AppRole |
+
+Wazuh, UniFi e Proxmox non hanno motori di credenziali dinamiche in Vault: in entrambi i modelli si usano segreti statici, ruotati a mano o con script.
 
 ---
 
 ## Riferimenti
 
-- Claude Code e MCP: <https://docs.claude.com/en/docs/claude-code/mcp>
-- Server MCP per Wazuh: <https://github.com/gbrigandi/mcp-server-wazuh>
-- Server MCP per UniFi: <https://github.com/sirkirby/unifi-mcp>
-- Environment e approvazioni di GitHub Actions: <https://docs.github.com/actions/deployment/targeting-different-environments/using-environments-for-deployment>
-- Runner self-hosted: <https://docs.github.com/actions/hosting-your-own-runners>
+- Claude Code — server MCP: <https://docs.claude.com/en/docs/claude-code/mcp>
+- Model Context Protocol: <https://modelcontextprotocol.io>
+- GitHub Actions — environment e approvazioni: <https://docs.github.com/actions/deployment/targeting-different-environments/using-environments-for-deployment>
+- GitHub Actions — runner self-hosted: <https://docs.github.com/actions/hosting-your-own-runners>
+- Server MCP Wazuh: <https://github.com/gbrigandi/mcp-server-wazuh>
+- Server MCP UniFi: <https://github.com/sirkirby/unifi-mcp>
+- Server MCP Proxmox: <https://github.com/GethosTheWalrus/proxmox-mcp>
+- uv: <https://docs.astral.sh/uv/>
+- OpenBao: <https://openbao.org>
