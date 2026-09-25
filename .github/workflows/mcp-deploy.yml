@@ -5,7 +5,7 @@ name: MCP · deploy
 
 on:
   push:
-    branches: [main]
+    branches: [wazuh]
     paths: ["config/**", "keys/**", "scripts/**", ".github/workflows/mcp-*.yml"]
   # da usare anche dopo aver ruotato un secret su GitHub
   workflow_dispatch:
